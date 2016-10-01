@@ -81,6 +81,8 @@ byte spreadingFactor = 11;
 byte codingRate = 8;
 boolean explicitHeaders = false;
 boolean rateOptimization = true;
+boolean afc = true;
+int postAfcMsgs = 0;
 
 boolean configUpdated = false;
 
@@ -141,6 +143,76 @@ void receiveTransmission() {
    Serial.print("Got msg (len="); Serial.print(len); Serial.print("):"); Serial.println(le.msg);
 
    sendToHabitat(le);
+
+   if (afc && (postAfcMsgs == 0))
+      doAFC();
+   else 
+      if (postAfcMsgs > 0) postAfcMsgs--;
+}
+
+/* The frequency of the LORA transmissions drifts over time (due to temperature changes?)
+ *  this tries to compensate by adjusting the Gateway receiver frequency based on the 
+ *  frequency error of the received messages. 
+ *  It tries to ignore spurious erorrs so of the last 3 messages it takes the average of 
+ *  the two smallest errors, and only adjusts if thats greater than 200 (Hz).
+*/
+void doAFC() {
+
+  // TODO: this mostly seems to work but there is bug where big changes
+  // like moving from freezer to warmth then AFC compensates twice, eg - 
+  // -4567, -5432, (afc -4999), -5555, -400, (afc -5493 which is wrong  
+  // for now fix that by waiting for two msgs before doing afc again
+  
+  // get the last 3 frequency errors
+  int i = nextLogIndex - 1;
+  if (i < 0) i = LOG_SIZE - 1;
+  int fe1 = msgLog[i].freqErr;  
+  if (abs(fe1) < 200) return;
+
+  i = i - 1;
+  if (i < 0) i = LOG_SIZE - 1;
+  if (msgLog[i].t == NULL) return;
+  int fe2 = msgLog[i].freqErr;  
+  if (abs(fe2) < 200) return;
+
+  i = i - 1;
+  if (i < 0) i = LOG_SIZE - 1;
+  if (msgLog[i].t == NULL) return;
+  int fe3 = msgLog[i].freqErr;  
+  if (abs(fe3) < 200) return;
+
+  // fe1, fe2, fe3 are the last three frequency errors
+
+  // now find the average of the two smallest errors
+  int d1 = abs(fe1 - fe2);
+  int d2 = abs(fe1 - fe3);
+  int d3 = abs(fe2 - fe3);
+
+  int fe;
+  if (d1 < d2)
+    if (d1 < d3)
+      fe = (fe1+fe2)/2;
+    else 
+      fe = (fe2+fe3)/2;
+  else
+    if (d2 < d3)
+      fe = (fe1+fe3)/2;
+    else
+      fe = (fe2+fe3)/2;
+  
+  // fe is now the average frequency error
+
+  // if its greater the 200Hz make an adjustment
+  if (abs(fe) > 200) {
+    Serial.print("***AFC: adjusting frequency by "); Serial.print(fe); Serial.println(" Hz");
+    frequency += (fe / 1000000.0);
+    rf95.setFrequency(frequency);
+    persistConfig();    
+
+    // the freq change only seems to get picked up after the next message received, so 
+    // don't do another AFC change for two more received msgs
+    postAfcMsgs = 2;
+  }  
 }
 
 void sendToHabitat(LogEntry le) {
@@ -171,11 +243,11 @@ void sendToHabitat(LogEntry le) {
    // for now just post some data to Thingspeak so can see something online
 
    String sendUrl = String("http://api.thingspeak.com/update?api_key=NG2Z4N1P6BVQSGE6&field1=") + le.msg.toInt() + "&field2=" + le.rssi;
-   Serial.print("Sending to ");  Serial.println(sendUrl);
+//   Serial.print("Sending to ");  Serial.println(sendUrl);
    HTTPClient http;
    http.begin(sendUrl);
    int httpCode = http.GET();
-   Serial.print("HTTP GET Response: "); Serial.println(httpCode); 
+//   Serial.print("HTTP GET Response: "); Serial.println(httpCode); 
    http.end();
 }
 
@@ -214,7 +286,7 @@ String getHtmlPage() {
   } else {
     response+="DISCONNECTED";
   }
-  response +="<br>";
+  response +="<br><br>";
 
   response +="Messages received: <b>"; response += txReceived; 
   response +="</b>, Receive Errors: <b>"; response += txError; 
@@ -261,8 +333,13 @@ String getHtmlPage() {
         "<option " + (codingRate==0x08? "selected" : "") + " value=\"4/8\">4/8</option>"
       "</select>"
       "<br>"
+
+      "<input type=\"checkbox\" name=\"afc\" value=\"On\" " + (afc ? "checked" : "") + ">AFC<br>" 
+
       "<input type=\"submit\" value=\"Update\">"
+      
       + (configUpdated ? "<b>Updated</b>" : "") + 
+      + (postAfcMsgs ? "&nbsp;<b>**AFC Change**</b>" : "") + 
     "</form> ";
   
   response +="<h2>Message Log</h2>";
@@ -310,7 +387,7 @@ void updateRadioConfig() {
 
    String crs = webServer.arg("codingRate");
    byte crx = codingRateToByte(crs);
-   
+
    if (bwx != bandwidth || sfx != spreadingFactor || crx != codingRate) {
       bandwidth = bwx;
       spreadingFactor = sfx;
@@ -319,6 +396,13 @@ void updateRadioConfig() {
       configUpdated = true;
    }
 
+   String afcs = webServer.arg("afc");
+   boolean afcx = (afcs == "On");
+   if (afcx != afc) {
+    afc = afcx;
+    configUpdated = true;
+   }
+   
    if (configUpdated) {
       persistConfig();
    }
@@ -338,6 +422,7 @@ void persistConfig() {
   EEPROM.put(addr, codingRate); addr += sizeof(codingRate);
   EEPROM.put(addr, explicitHeaders); addr += sizeof(explicitHeaders);
   EEPROM.put(addr, rateOptimization); addr += sizeof(rateOptimization);
+  EEPROM.put(addr, afc); addr += sizeof(afc);
   // update loadConfig() and printConfig() if anything else added here
   
   EEPROM.commit();
@@ -357,6 +442,7 @@ void loadConfig() {
   EEPROM.get(addr, codingRate); addr += sizeof(codingRate);
   EEPROM.get(addr, explicitHeaders); addr += sizeof(explicitHeaders);
   EEPROM.get(addr, rateOptimization); addr += sizeof(rateOptimization);
+  EEPROM.get(addr, afc); addr += sizeof(afc);
 }
 
 void printConfig() {
@@ -366,6 +452,7 @@ void printConfig() {
   Serial.print(", ECC codingRate="); Serial.print(codingRateToString(codingRate));
   Serial.print(", Headers are "); Serial.print(explicitHeaders? "Explicit" : "Implicit");
   Serial.print(", Rate Optimization is "); Serial.print(rateOptimization? "On" : "Off");
+  Serial.print(", AFC is "); Serial.print(afc? "On" : "Off");
   Serial.println();
 }
 
