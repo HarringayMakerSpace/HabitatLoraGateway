@@ -27,6 +27,7 @@
  * License: Apache License v2
 */
 #include <ESP8266HTTPClient.h>
+#include <EEPROM.h>
 #include <time.h>
 #include <SPI.h>
 #include <RH_RF95.h>
@@ -43,24 +44,37 @@
 
 String  GATEWAY_ID = "HABGateway-"; // will have the ESP Chip ID appended
 
-RH_RF95 rf95(15, 5); // NSS=GPIO-15, DIO0=GPIO-5
+#define NSS_PIN 15
+#define DIO0_PIN 5
+
+RH_RF95 rf95(NSS_PIN, DIO0_PIN);
 
 ESP8266WebServer webServer(80);
 
 time_t startupTime;
 
+// this must match the struct in the tracker sketch
+struct TBinaryPacket {
+  uint8_t      id;
+  uint16_t  counter;
+  float     latitude;
+  float     longitude;
+  int32_t   alt;
+} __attribute__ ((packed));
+
 int txReceived, txError; 
 
-const int LOG_SIZE = 10;
-int nextLogIndex;
 struct LogEntry {
   time_t t;
   int rssi;
   int freqErr;
   String msg;
 };
+const int LOG_SIZE = 10;
 LogEntry msgLog[LOG_SIZE];
+int nextLogIndex;
 
+// these will persist over power off by being persisted in EEPROM
 double frequency = 434.0000;
 byte bandwidth = 64;
 byte spreadingFactor = 11;
@@ -76,6 +90,8 @@ void setup() {
   GATEWAY_ID += String(ESP.getChipId(), HEX);
   Serial.print(GATEWAY_ID); Serial.println(", compiled: "  __DATE__  ", " __TIME__ );
 
+  loadConfig();
+  
   initWifiManager();
   initOTA();
   configTime(1 * 3600, 0, "pool.ntp.org", "time.nist.gov"); 
@@ -95,9 +111,9 @@ void loop() {
 }
 
 void receiveTransmission() {
-
   uint8_t buf[255];
   uint8_t len = sizeof(buf);
+
   if ( ! rf95.recv(buf, &len)) {
       Serial.println("***RF95 receive error");
       txError++;
@@ -105,13 +121,19 @@ void receiveTransmission() {
   }
       
   txReceived++;
-  buf[len] = 0; // null delimit the string
-      
+
   LogEntry le;
   le.t = time(NULL);
   le.rssi = rf95.lastRssi();
   le.freqErr = (frequencyError());
-  le.msg = String((char*)buf); // Its binary data, String just a convenient container (TODO?)
+
+  TBinaryPacket payload;
+  if (len == sizeof(payload)) {
+    memcpy(&payload, buf, sizeof(payload));
+    le.msg = String(payload.counter) + "," + payload.latitude + "," + payload.longitude + "," + payload.alt; 
+  } else {
+    le.msg = byteArrayToHexString(buf, len);
+  }
 
    msgLog[nextLogIndex++] = le;
    if (nextLogIndex >= LOG_SIZE) nextLogIndex = 0;
@@ -282,6 +304,7 @@ void updateRadioConfig() {
     }
 
    int sfx = webServer.arg("sf").toInt();
+
    String bws = webServer.arg("bw");
    byte bwx = bandwidthTobyte(bws);
 
@@ -296,9 +319,54 @@ void updateRadioConfig() {
       configUpdated = true;
    }
 
+   if (configUpdated) {
+      persistConfig();
+   }
+   
    // redirect back to main page
    webServer.sendHeader("Location", String("/"), true);
    webServer.send ( 302, "text/plain", "");
+}
+
+void persistConfig() {
+  EEPROM.begin(512);
+  EEPROM.write(0, 0x77); // flag to indicate EEPROM contains a config
+  int addr = 1;
+  EEPROM.put(addr, frequency); addr += sizeof(frequency);
+  EEPROM.put(addr, spreadingFactor); addr += sizeof(spreadingFactor);
+  EEPROM.put(addr, bandwidth); addr += sizeof(bandwidth);
+  EEPROM.put(addr, codingRate); addr += sizeof(codingRate);
+  EEPROM.put(addr, explicitHeaders); addr += sizeof(explicitHeaders);
+  EEPROM.put(addr, rateOptimization); addr += sizeof(rateOptimization);
+  // update loadConfig() and printConfig() if anything else added here
+  
+  EEPROM.commit();
+
+  Serial.print("Saved "); printConfig();
+}
+
+void loadConfig() {
+  EEPROM.begin(512);
+
+  if (EEPROM.read(0) != 0x77) return; // do nothing if no config previously saved yet
+
+  int addr = 1;
+  EEPROM.get(addr, frequency); addr += sizeof(frequency);
+  EEPROM.get(addr, spreadingFactor); addr += sizeof(spreadingFactor);
+  EEPROM.get(addr, bandwidth); addr += sizeof(bandwidth);
+  EEPROM.get(addr, codingRate); addr += sizeof(codingRate);
+  EEPROM.get(addr, explicitHeaders); addr += sizeof(explicitHeaders);
+  EEPROM.get(addr, rateOptimization); addr += sizeof(rateOptimization);
+}
+
+void printConfig() {
+  Serial.print("Config: Frequency="); Serial.print(frequency, 4); 
+  Serial.print(" (MHz), SpreadingFactor="); Serial.print(spreadingFactor);
+  Serial.print(", Bandwidth="); Serial.print(bandwidthToString(bandwidth));
+  Serial.print(", ECC codingRate="); Serial.print(codingRateToString(codingRate));
+  Serial.print(", Headers are "); Serial.print(explicitHeaders? "Explicit" : "Implicit");
+  Serial.print(", Rate Optimization is "); Serial.print(rateOptimization? "On" : "Off");
+  Serial.println();
 }
 
 /* Configure the LORA radio settings
@@ -307,11 +375,11 @@ void updateRadioConfig() {
  *  Coding Rate can be 2, 4, 6, or 8 (See section 4.1.1.3. Coding Rate)
  *  Rate Optimization can be 
  */
-void rf95Config(byte bandwidth, byte spreadingFactor, byte codeRate, boolean explicitHeaders, boolean rateOptimisation) {
+void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean explicitHeaders, boolean rateOptimisation) {
   RH_RF95::ModemConfig rf95Config;
-  rf95Config.reg_1d = bandwidth + codeRate + (explicitHeaders ? 1 : 0);
+  rf95Config.reg_1d = bandwidth + codingRate + (explicitHeaders ? 1 : 0);
   rf95Config.reg_1e = (spreadingFactor * 16) + 7;
-  rf95Config.reg_26 = (rateOptimisation ? 0x08 : 0x00);
+  rf95Config.reg_26 = (rateOptimisation ? 0x08 : 0x00); // TODO: what is rateOptimisation about?
   
   rf95.setModemRegisters(&rf95Config);
 }
@@ -325,13 +393,7 @@ void initRF95() {
   rf95.setFrequency(frequency);
   rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
 
-  Serial.print("RF95 started on frequency "); Serial.print(frequency, 4);
-  Serial.print("(MHz), spreading factor "); Serial.print(spreadingFactor);
-  Serial.print(", bandwidth "); Serial.print(bandwidthToString(bandwidth));
-  Serial.print(", coding rate "); Serial.print(codingRateToString(codingRate));
-  Serial.print(", headers are "); Serial.print((explicitHeaders? "explicit" : "implicit"));
-  Serial.print(", rate optimization "); Serial.print(rateOptimization);
-  Serial.println();
+  printConfig();
 }
 
 void initWifiManager() {
@@ -382,6 +444,20 @@ void waitForNTP() {
    Serial.print("Time at startup: "); Serial.println(ctime(&startupTime));
 }
 
+String byteArrayToHexString(uint8_t buf[], uint8_t len) {
+  String s;
+  for (int i=0; i<len; i++) {
+    if (i>0 && (i%2 == 0)) s+= ' ';     
+    String c = String(buf[i], HEX);
+    if (c.length() < 2) {
+      s+= '0'; // add leading zero
+    }
+    s+= c;
+  }
+  s.toUpperCase();
+  return s;
+}
+
 #define REG_FREQ_ERROR 0x28
 
 // frequency error calculation from https://github.com/daveake/LoRaArduinoSerial/blob/master/LoRaArduinoSerial.ino
@@ -430,7 +506,7 @@ double frequencyError(void) {
 
 double bandwidthToDecimal(byte bw) {
   switch (bw) {
-    case  BANDWIDTH_7K8:  return 7800;
+    case  BANDWIDTH_7K8:    return 7800;
     case  BANDWIDTH_10K4:   return 10400; 
     case  BANDWIDTH_15K6:   return 15600; 
     case  BANDWIDTH_20K8:   return 20800; 
@@ -496,5 +572,4 @@ byte codingRateToByte(String crs) {
    if (crs == CODING_RATE_4_7_S)   return CODING_RATE_4_7;
    if (crs == CODING_RATE_4_8_S)   return CODING_RATE_4_8;
 }
-
 
