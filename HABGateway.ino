@@ -43,9 +43,6 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h> 
 
-String  GATEWAY_ID = "HMS-"; // will have the ESP Chip ID appended
-const String SENTANCE_ID = "$$test1";
-
 #define NSS_PIN 15
 #define DIO0_PIN 5
 
@@ -55,16 +52,6 @@ ESP8266WebServer webServer(80);
 
 time_t startupTime;
 
-// this must match the struct in the tracker sketch
-struct TBinaryPacket {
-  uint8_t   id;
-//  uint16_t  t;
-  uint16_t  counter;
-  float     latitude;
-  float     longitude;
-  int32_t   alt;
-}  __attribute__ ((packed));
-
 int txReceived, txError; 
 
 struct LogEntry {
@@ -72,7 +59,6 @@ struct LogEntry {
   int rssi;
   int freqErr;
   String msg;
-  TBinaryPacket packet;
 };
 int nextLogIndex;
 const int LOG_SIZE = 10;
@@ -88,6 +74,7 @@ boolean rateOptimization = true;
 boolean afc = true;
 boolean habitat = true;
 int postAfcMsgs = 0;
+String  gatewayName = "HMS-"; // will have the ESP Chip ID appended
 
 boolean configUpdated = false;
 
@@ -95,7 +82,7 @@ void setup() {
   Serial.begin(115200); Serial.println();
   Serial.println("HMS LORA Gateway, compiled: "  __DATE__  ", " __TIME__ );
 
-  GATEWAY_ID += String(ESP.getChipId(), HEX);
+  gatewayName += String(ESP.getChipId(), HEX);
   loadConfig();
   
   initWifiManager();
@@ -129,27 +116,23 @@ void receiveTransmission() {
   txReceived++;
 
   LogEntry le;
-//  le.t = time(NULL);
+  le.t = time(NULL);
   le.rssi = rf95.lastRssi();
   le.freqErr = (frequencyError());
 
-  TBinaryPacket payload;
-  if (len == sizeof(payload)) {
-    memcpy(&payload, buf, sizeof(payload));
-//    le.msg = String(payload.counter) + ", " + String(payload.latitude, 7) + ", " + String(payload.longitude, 7) + ", " + payload.alt; 
-    le.packet = payload;
-    le.msg = "";
+  if (buf[0] == '$' && buf[1] == '$') {
+    buf[len] = 0x00; // ensure null terminated
+    le.msg = String((char*)buf);     
   } else {
     le.msg = byteArrayToHexString(buf, len);
   }
 
-   msgLog[nextLogIndex++] = le;
-   if (nextLogIndex >= LOG_SIZE) nextLogIndex = 0;
+  msgLog[nextLogIndex++] = le;
+  if (nextLogIndex >= LOG_SIZE) nextLogIndex = 0;
             
-  String s  = "LogEntry " + String(ctime(&le.t)) + ", RSSI=" + le.rssi + ", Freq Err=" + le.freqErr + ", payload=" + le.msg;
-  Serial.println(s);
+  Serial.println("LogEntry " + getRFC3339Time(le.t) + ", RSSI=" + le.rssi + ", Freq Err=" + le.freqErr + ", payload=" + le.msg);
 
-  if (habitat && (le.msg == "")) {
+  if (habitat && le.msg.startsWith("$$")) {
      sendToHabitat(le);
   }
 
@@ -159,23 +142,13 @@ void receiveTransmission() {
     if (postAfcMsgs > 0) postAfcMsgs--;
 }
 
+// $$test1,1,01:23:45,51.58680343,-0.10234091,23*28\n
 void sendToHabitat(LogEntry le) {
 
    // TODO: do this async in the background so as not to block LORA receives? 
 
-   TBinaryPacket packet = le.packet;
-
-  // $$test1,1,01:23:45,51.58680343,-0.10234091,23*28\n
-
-  String t = getTimeNow(time(NULL));
-  String sentance = SENTANCE_ID + "," + packet.counter + "," + t + "," + String(packet.latitude,6) + "," + String(packet.longitude,6) + "," + packet.alt;
-//  String sentance = SENTANCE_ID + "," + packet.counter + "," + packet.t + "," + String(packet.latitude,6) + "," + String(packet.longitude,6) + "," + packet.alt;
-  sentance += "*" + xorChecksum(sentance) + "\n";
-  
-  Serial.print("Sentance:"); Serial.print(sentance);
-
+  String sentance = le.msg + "*" + xorChecksum(le.msg) + "\n";
   String b64Sentence = base64::encode(sentance);
-  
   String sha256Sentence = sha256Hash(b64Sentence);
 
    HTTPClient http;
@@ -192,18 +165,19 @@ void sendToHabitat(LogEntry le) {
         "\"_raw\": \"" + b64Sentence + "\""
     "},"
     "\"receivers\": {"
-       "\"" + GATEWAY_ID + "\": {"
+       "\"" + gatewayName + "\": {"
             "\"time_created\": \"" + timeNow + "\","
             "\"time_uploaded\": \"" + timeNow + "\""
          "}"
        "}"
     "}";
 
-   Serial.print("Payload: "); Serial.println(payload);
+   Serial.print("Habitat payload: "); Serial.println(payload);
    
    int httpCode = http.sendRequest("PUT", payload);
-   Serial.print("HTTP PUT Response: "); Serial.println(httpCode);
-
+   Serial.print("Habitat PUT Response: "); Serial.println(httpCode);
+   // TODO: do something with errors? Maybe save the sentance and try again later
+   
    http.end();
 }
 
@@ -223,10 +197,10 @@ String getHtmlPage() {
   String response = 
     "<!DOCTYPE HTML>"
     "<HTML><HEAD>"
-      "<TITLE>" + GATEWAY_ID + "</TITLE>"
+      "<TITLE>" + gatewayName + "</TITLE>"
     "</HEAD>"
     "<BODY>"
-    "<h1>" + GATEWAY_ID + "</h1>";
+    "<h1>" + gatewayName + "</h1>";
 
   time_t t = time(NULL);
   response += "Current time is: <b>" + String(ctime(&t)) + "</b>"; 
@@ -254,7 +228,7 @@ String getHtmlPage() {
     "<h2>Receiver Settings</h2>"
     "<form action=\"setconfig\">"
       "Gateway Name:"
-      "<input type=\"text\" name=\"gatewayName\" value=\"" + GATEWAY_ID + "\">"
+      "<input type=\"text\" name=\"gatewayName\" value=\"" + gatewayName + "\">"
       "<br>"
       "Frequency (MHz):"
       "<input type=\"text\" name=\"frequency\" value=\"" + String(frequency, 4) + "\">"
@@ -372,8 +346,8 @@ void updateRadioConfig() {
    }
 
     String gns = webServer.arg("gatewayName");
-    if (gns != GATEWAY_ID) {
-      GATEWAY_ID = gns;
+    if (gns != gatewayName) {
+      gatewayName = gns;
       configUpdated = true;
     }
    
@@ -399,7 +373,7 @@ void persistConfig() {
   EEPROM.put(addr, explicitHeaders);    addr += sizeof(explicitHeaders);
   EEPROM.put(addr, rateOptimization);   addr += sizeof(rateOptimization);
   EEPROM.put(addr, afc);                addr += sizeof(afc); 
-  addr = eepromWriteString(addr, GATEWAY_ID);
+  addr = eepromWriteString(addr, gatewayName);
   EEPROM.put(addr, habitat);            addr += sizeof(habitat); 
 
   // update loadConfig() and printConfig() if anything else added here
@@ -425,13 +399,13 @@ void loadConfig() {
   EEPROM.get(addr, explicitHeaders);         addr += sizeof(explicitHeaders);
   EEPROM.get(addr, rateOptimization);        addr += sizeof(rateOptimization);
   EEPROM.get(addr, afc);                     addr += sizeof(afc); 
-  GATEWAY_ID = eepromReadString(addr);       addr += GATEWAY_ID.length() + 1;
+  gatewayName = eepromReadString(addr);      addr += gatewayName.length() + 1;
   EEPROM.get(addr, habitat);                 addr += sizeof(habitat); 
 }
 
 void printConfig() {
-  Serial.print("HMS Gateway "); Serial.print(GATEWAY_ID); 
-  Serial.print(": Frequency="); Serial.print(frequency, 4); 
+  Serial.print("Gateway Name '"); Serial.print(gatewayName); 
+  Serial.print("', Frequency="); Serial.print(frequency, 4); 
   Serial.print(" (MHz), SpreadingFactor="); Serial.print(spreadingFactor);
   Serial.print(", Bandwidth="); Serial.print(bandwidthToString(bandwidth));
   Serial.print(", ECC codingRate="); Serial.print(codingRateToString(codingRate));
@@ -490,7 +464,7 @@ void initRF95() {
 void initWifiManager() {
   WiFiManager wifiManager;
   wifiManager.setTimeout(180);
-  if( ! wifiManager.autoConnect(GATEWAY_ID.c_str())) {
+  if( ! wifiManager.autoConnect(gatewayName.c_str())) {
     Serial.println("Timeout connecting. Restarting...");
     delay(1000);
     ESP.reset();
@@ -501,7 +475,7 @@ void initWifiManager() {
 }
 
 void initOTA() {
-  ArduinoOTA.setHostname(GATEWAY_ID.c_str());
+  ArduinoOTA.setHostname(gatewayName.c_str());
 
   ArduinoOTA.onStart([]() {
     Serial.println("OTA Start");
