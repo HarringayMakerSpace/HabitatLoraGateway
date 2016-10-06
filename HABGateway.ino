@@ -29,6 +29,7 @@
 #include <ESP8266HTTPClient.h>
 #include <EEPROM.h>
 #include <time.h>
+#include <base64.h>
 #include <SPI.h>
 #include <RH_RF95.h>
 
@@ -42,7 +43,8 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h> 
 
-String  GATEWAY_ID = "HABGateway-"; // will have the ESP Chip ID appended
+String  GATEWAY_ID = "HMS-"; // will have the ESP Chip ID appended
+const String SENTANCE_ID = "$$test1";
 
 #define NSS_PIN 15
 #define DIO0_PIN 5
@@ -55,12 +57,13 @@ time_t startupTime;
 
 // this must match the struct in the tracker sketch
 struct TBinaryPacket {
-  uint8_t      id;
+  uint8_t   id;
+//  uint16_t  t;
   uint16_t  counter;
   float     latitude;
   float     longitude;
   int32_t   alt;
-} __attribute__ ((packed));
+}  __attribute__ ((packed));
 
 int txReceived, txError; 
 
@@ -69,12 +72,13 @@ struct LogEntry {
   int rssi;
   int freqErr;
   String msg;
+  TBinaryPacket packet;
 };
+int nextLogIndex;
 const int LOG_SIZE = 10;
 LogEntry msgLog[LOG_SIZE];
-int nextLogIndex;
 
-// these will persist over power off by being persisted in EEPROM
+// these will retained over power off by being persisted in EEPROM
 double frequency = 434.0000;
 byte bandwidth = 64;
 byte spreadingFactor = 11;
@@ -82,16 +86,16 @@ byte codingRate = 8;
 boolean explicitHeaders = false;
 boolean rateOptimization = true;
 boolean afc = true;
+boolean habitat = true;
 int postAfcMsgs = 0;
 
 boolean configUpdated = false;
 
 void setup() {
   Serial.begin(115200); Serial.println();
+  Serial.println("HMS LORA Gateway, compiled: "  __DATE__  ", " __TIME__ );
 
   GATEWAY_ID += String(ESP.getChipId(), HEX);
-  Serial.print(GATEWAY_ID); Serial.println(", compiled: "  __DATE__  ", " __TIME__ );
-
   loadConfig();
   
   initWifiManager();
@@ -113,9 +117,9 @@ void loop() {
 }
 
 void receiveTransmission() {
+
   uint8_t buf[255];
   uint8_t len = sizeof(buf);
-
   if ( ! rf95.recv(buf, &len)) {
       Serial.println("***RF95 receive error");
       txError++;
@@ -125,14 +129,16 @@ void receiveTransmission() {
   txReceived++;
 
   LogEntry le;
-  le.t = time(NULL);
+//  le.t = time(NULL);
   le.rssi = rf95.lastRssi();
   le.freqErr = (frequencyError());
 
   TBinaryPacket payload;
   if (len == sizeof(payload)) {
     memcpy(&payload, buf, sizeof(payload));
-    le.msg = String(payload.counter) + "," + payload.latitude + "," + payload.longitude + "," + payload.alt; 
+//    le.msg = String(payload.counter) + ", " + String(payload.latitude, 7) + ", " + String(payload.longitude, 7) + ", " + payload.alt; 
+    le.packet = payload;
+    le.msg = "";
   } else {
     le.msg = byteArrayToHexString(buf, len);
   }
@@ -140,14 +146,383 @@ void receiveTransmission() {
    msgLog[nextLogIndex++] = le;
    if (nextLogIndex >= LOG_SIZE) nextLogIndex = 0;
             
-   Serial.print("Got msg (len="); Serial.print(len); Serial.print("):"); Serial.println(le.msg);
+  String s  = "LogEntry " + String(ctime(&le.t)) + ", RSSI=" + le.rssi + ", Freq Err=" + le.freqErr + ", payload=" + le.msg;
+  Serial.println(s);
 
-   sendToHabitat(le);
+  if (habitat && (le.msg == "")) {
+     sendToHabitat(le);
+  }
 
-   if (afc && (postAfcMsgs == 0))
-      doAFC();
-   else 
-      if (postAfcMsgs > 0) postAfcMsgs--;
+  if (afc && (postAfcMsgs == 0))
+    doAFC();
+  else 
+    if (postAfcMsgs > 0) postAfcMsgs--;
+}
+
+void sendToHabitat(LogEntry le) {
+
+   // TODO: do this async in the background so as not to block LORA receives? 
+
+   TBinaryPacket packet = le.packet;
+
+  // $$test1,1,01:23:45,51.58680343,-0.10234091,23*28\n
+
+  String t = getTimeNow(time(NULL));
+  String sentance = SENTANCE_ID + "," + packet.counter + "," + t + "," + String(packet.latitude,6) + "," + String(packet.longitude,6) + "," + packet.alt;
+//  String sentance = SENTANCE_ID + "," + packet.counter + "," + packet.t + "," + String(packet.latitude,6) + "," + String(packet.longitude,6) + "," + packet.alt;
+  sentance += "*" + xorChecksum(sentance) + "\n";
+  
+  Serial.print("Sentance:"); Serial.print(sentance);
+
+  String b64Sentence = base64::encode(sentance);
+  
+  String sha256Sentence = sha256Hash(b64Sentence);
+
+   HTTPClient http;
+   http.begin("http://habitat.habhub.org/habitat/_design/payload_telemetry/_update/add_listener/" + sha256Sentence);
+
+   http.addHeader("Content-Type", "application/json");
+   http.addHeader("Accept", "application/json");
+   http.addHeader("charsets", "utf-8");
+
+   String timeNow = getRFC3339Time(time(NULL));
+   
+   String payload = "{" 
+    "\"data\": {"
+        "\"_raw\": \"" + b64Sentence + "\""
+    "},"
+    "\"receivers\": {"
+       "\"" + GATEWAY_ID + "\": {"
+            "\"time_created\": \"" + timeNow + "\","
+            "\"time_uploaded\": \"" + timeNow + "\""
+         "}"
+       "}"
+    "}";
+
+   Serial.print("Payload: "); Serial.println(payload);
+   
+   int httpCode = http.sendRequest("PUT", payload);
+   Serial.print("HTTP PUT Response: "); Serial.println(httpCode);
+
+   http.end();
+}
+
+void initWebServer() {
+  webServer.on("/", []() {
+    webServer.send(200, "text/html", getHtmlPage());
+  });
+  webServer.on("/setconfig", []() {
+    updateRadioConfig();
+  });
+  webServer.begin();
+  Serial.println("WebServer started on port 80");
+}
+
+String getHtmlPage() {
+  // TODO store all these literals in flash?
+  String response = 
+    "<!DOCTYPE HTML>"
+    "<HTML><HEAD>"
+      "<TITLE>" + GATEWAY_ID + "</TITLE>"
+    "</HEAD>"
+    "<BODY>"
+    "<h1>" + GATEWAY_ID + "</h1>";
+
+  time_t t = time(NULL);
+  response += "Current time is: <b>" + String(ctime(&t)) + "</b>"; 
+  response += ", up since: <b>" + String(ctime(&startupTime)) + "</b>"; 
+  response +="<br>";
+
+  response +="WiFi is "; 
+  if (WiFi.status() == WL_CONNECTED) {
+    response+="connected to: <b>"; response += WiFi.SSID();
+    response += "</b>, IP address: <b>"; response += WiFi.localIP().toString();
+    response += "</b>, WiFi connection RSSI: <b>"; response += WiFi.RSSI();
+    response += "</b>";
+  } else {
+    response+="DISCONNECTED";
+  }
+  response +="<br><br>";
+
+  response +="Messages received: <b>"; response += txReceived; 
+  response +="</b>, Receive Errors: <b>"; response += txError; 
+  response +="</b>, LORA background noise RSSI: <b>"; response += (rf95.spiRead(RH_RF95_REG_1B_RSSI_VALUE) - 137); 
+  response +="</b>"; 
+  response +="<br>";
+
+  response +=
+    "<h2>Receiver Settings</h2>"
+    "<form action=\"setconfig\">"
+      "Gateway Name:"
+      "<input type=\"text\" name=\"gatewayName\" value=\"" + GATEWAY_ID + "\">"
+      "<br>"
+      "Frequency (MHz):"
+      "<input type=\"text\" name=\"frequency\" value=\"" + String(frequency, 4) + "\">"
+      "&nbsp;&nbsp;"
+      "Spreading Factor:"
+      "<select name=\"sf\">"
+        "<option " + (spreadingFactor==6? "selected" : "") + " value=\"6\">6</option>"
+        "<option " + (spreadingFactor==7? "selected" : "") + " value=\"7\">7</option>"
+        "<option " + (spreadingFactor==8? "selected" : "") + " value=\"8\">8</option>"
+        "<option " + (spreadingFactor==9? "selected" : "") + " value=\"9\">9</option>"
+        "<option " + (spreadingFactor==10? "selected" : "") + " value=\"10\">10</option>"
+        "<option " + (spreadingFactor==11? "selected" : "") + " value=\"11\">11</option>"
+        "<option " + (spreadingFactor==12? "selected" : "") + " value=\"12\">12</option>"
+      "</select>"
+      "&nbsp;&nbsp;"
+      "Bandwidth:"
+      "<select name=\"bw\">"
+        "<option " + (bandwidth==0x00? "selected" : "") + " value=\"7k8\">7k8</option>"
+        "<option " + (bandwidth==0x10? "selected" : "") + " value=\"10k4\">10k4</option>"
+        "<option " + (bandwidth==0x20? "selected" : "") + " value=\"15k6\">15k6</option>"
+        "<option " + (bandwidth==0x30? "selected" : "") + " value=\"20k8\">20k8</option>"
+        "<option " + (bandwidth==0x40? "selected" : "") + " value=\"31k25\">31k25</option>"
+        "<option " + (bandwidth==0x50? "selected" : "") + " value=\"41k7\">41k7</option>"
+        "<option " + (bandwidth==0x60? "selected" : "") + " value=\"62k5\">62k5</option>"
+        "<option " + (bandwidth==0x70? "selected" : "") + " value=\"125k\">125k</option>"
+        "<option " + (bandwidth==0x80? "selected" : "") + " value=\"250k\">250k</option>"
+        "<option " + (bandwidth==0x90? "selected" : "") + " value=\"500k\">500k</option>"
+      "</select>"
+      "&nbsp;&nbsp;"
+      "Coding rate:"
+      "<select name=\"codingRate\">"
+        "<option " + (codingRate==0x02? "selected" : "") + " value=\"4/5\">4/5</option>"
+        "<option " + (codingRate==0x04? "selected" : "") + " value=\"4/6\">4/6</option>"
+        "<option " + (codingRate==0x06? "selected" : "") + " value=\"4/7\">4/7</option>"
+        "<option " + (codingRate==0x08? "selected" : "") + " value=\"4/8\">4/8</option>"
+      "</select>"
+      "<br>"
+
+      "<input type=\"checkbox\" name=\"afc\" value=\"On\" " + (afc ? "checked" : "") + ">AFC" 
+
+      "<input type=\"checkbox\" name=\"habitat\" value=\"On\" " + (habitat ? "checked" : "") + ">Habitat<br>" 
+
+      "<input type=\"submit\" value=\"Update\">"
+      
+      + (configUpdated ? "<b>Updated</b>" : "") + 
+      + (postAfcMsgs ? "&nbsp;<b>**AFC Change**</b>" : "") + 
+    "</form> ";
+  
+  response +="<h2>Message Log</h2>";
+  response +="<table style=\"max_width: 100%; min-width: 40%; border: 1px solid black; border-collapse: collapse;\" class=\"config_table\">";
+  response +="<tr>";
+  response +="<th style=\"background-color: green; color: white;\">Time</th>";
+  response +="<th style=\"background-color: green; color: white;\">RSSI</th>";
+  response +="<th style=\"background-color: green; color: white;\">Freq Err</th>";
+  response +="<th style=\"background-color: green; color: white;\">Sentence</th>";
+  response +="</tr>";
+  int j = nextLogIndex;
+  for (int i=0; i<LOG_SIZE; i++) {
+     j--;
+     if (j<0) j=LOG_SIZE-1;
+     if (msgLog[j].t != NULL) {
+       response +="<tr>"; 
+       response +="<td style=\"border: 1px solid black;\">" + String(ctime(&msgLog[j].t)) + "</td>"; 
+       response +="<td style=\"border: 1px solid black;\">" + String(msgLog[j].rssi) + "</td>"; 
+       response +="<td style=\"border: 1px solid black;\">" + String(msgLog[j].freqErr) + "</td>"; 
+       response +="<td style=\"border: 1px solid black;\">" + msgLog[j].msg + "</td>"; 
+       response+="</tr>";
+     }
+  }
+  response +="</table>";
+    
+  response +="</BODY></HTML>";
+
+  configUpdated = false;
+  
+  return response;
+}
+
+void updateRadioConfig() {
+    double fx = webServer.arg("frequency").toFloat();
+    if (fx != frequency) {
+      frequency = fx;
+      rf95.setFrequency(frequency);
+      configUpdated = true;
+    }
+
+   int sfx = webServer.arg("sf").toInt();
+
+   String bws = webServer.arg("bw");
+   byte bwx = bandwidthTobyte(bws);
+
+   String crs = webServer.arg("codingRate");
+   byte crx = codingRateToByte(crs);
+
+   if (bwx != bandwidth || sfx != spreadingFactor || crx != codingRate) {
+      bandwidth = bwx;
+      spreadingFactor = sfx;
+      codingRate = crx;
+      rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
+      configUpdated = true;
+   }
+
+   String afcs = webServer.arg("afc");
+   boolean afcx = (afcs == "On");
+   if (afcx != afc) {
+    afc = afcx;
+    configUpdated = true;
+   }
+
+   String habitats = webServer.arg("habitat");
+   boolean habitatx = (habitats == "On");
+   if (habitatx != habitat) {
+    habitat = habitatx;
+    configUpdated = true;
+   }
+
+    String gns = webServer.arg("gatewayName");
+    if (gns != GATEWAY_ID) {
+      GATEWAY_ID = gns;
+      configUpdated = true;
+    }
+   
+   if (configUpdated) {
+      persistConfig();
+   }
+   
+   // redirect back to main page
+   webServer.sendHeader("Location", String("/"), true);
+   webServer.send ( 302, "text/plain", "");
+}
+
+#define EEPROM_SAVED_MARKER 72
+
+void persistConfig() {
+  EEPROM.begin(512);
+  EEPROM.write(0, EEPROM_SAVED_MARKER); // flag to indicate EEPROM contains a config
+  int addr = 1;
+  EEPROM.put(addr, frequency);          addr += sizeof(frequency);
+  EEPROM.put(addr, spreadingFactor);    addr += sizeof(spreadingFactor);
+  EEPROM.put(addr, bandwidth);          addr += sizeof(bandwidth);
+  EEPROM.put(addr, codingRate);         addr += sizeof(codingRate);
+  EEPROM.put(addr, explicitHeaders);    addr += sizeof(explicitHeaders);
+  EEPROM.put(addr, rateOptimization);   addr += sizeof(rateOptimization);
+  EEPROM.put(addr, afc);                addr += sizeof(afc); 
+  addr = eepromWriteString(addr, GATEWAY_ID);
+  EEPROM.put(addr, habitat);            addr += sizeof(habitat); 
+
+  // update loadConfig() and printConfig() if anything else added here
+  
+  EEPROM.commit();
+
+  Serial.print("Saved "); printConfig();
+}
+
+void loadConfig() {
+  EEPROM.begin(512);
+
+  if (EEPROM.read(0) != EEPROM_SAVED_MARKER) {
+    Serial.println("Using default config");
+    return; 
+  }
+
+  int addr = 1;
+  EEPROM.get(addr, frequency);               addr += sizeof(frequency);
+  EEPROM.get(addr, spreadingFactor);         addr += sizeof(spreadingFactor);
+  EEPROM.get(addr, bandwidth);               addr += sizeof(bandwidth);
+  EEPROM.get(addr, codingRate);              addr += sizeof(codingRate);
+  EEPROM.get(addr, explicitHeaders);         addr += sizeof(explicitHeaders);
+  EEPROM.get(addr, rateOptimization);        addr += sizeof(rateOptimization);
+  EEPROM.get(addr, afc);                     addr += sizeof(afc); 
+  GATEWAY_ID = eepromReadString(addr);       addr += GATEWAY_ID.length() + 1;
+  EEPROM.get(addr, habitat);                 addr += sizeof(habitat); 
+}
+
+void printConfig() {
+  Serial.print("HMS Gateway "); Serial.print(GATEWAY_ID); 
+  Serial.print(": Frequency="); Serial.print(frequency, 4); 
+  Serial.print(" (MHz), SpreadingFactor="); Serial.print(spreadingFactor);
+  Serial.print(", Bandwidth="); Serial.print(bandwidthToString(bandwidth));
+  Serial.print(", ECC codingRate="); Serial.print(codingRateToString(codingRate));
+  Serial.print(", Headers are "); Serial.print(explicitHeaders? "Explicit" : "Implicit");
+  Serial.print(", Rate Optimization is "); Serial.print(rateOptimization? "On" : "Off");
+  Serial.print(", AFC is "); Serial.print(afc? "On" : "Off");
+  Serial.print(", Habitat is "); Serial.print(habitat? "On" : "Off");
+  Serial.println();
+}
+
+int eepromWriteString(int addr, String s) {
+  int l = s.length();
+  for (int i=0; i<l; i++) {
+     EEPROM.write(addr++, s.charAt(i));
+  }
+  EEPROM.write(addr++, 0x00);
+  return addr;  
+}
+
+String eepromReadString(int addr) {
+  String s;
+  char c;
+  while ((c = EEPROM.read(addr++)) != 0x00) {
+     s += c;
+  }
+  return s;
+}
+
+/* Configure the LORA radio settings
+ *  Bandwidth can be: (See section 4.1.1.4. Signal Bandwidth)
+ *  Spreading Factor can be 6 to 12 (See section 4.1.1.2. Spreading Factor)
+ *  Coding Rate can be 2, 4, 6, or 8 (See section 4.1.1.3. Coding Rate)
+ *  Rate Optimization can be 
+ */
+void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean explicitHeaders, boolean rateOptimisation) {
+  RH_RF95::ModemConfig rf95Config;
+  rf95Config.reg_1d = bandwidth + codingRate + (explicitHeaders ? 1 : 0);
+  rf95Config.reg_1e = (spreadingFactor * 16) + 7;
+  rf95Config.reg_26 = (rateOptimisation ? 0x08 : 0x00); // TODO: what is rateOptimisation about?
+  
+  rf95.setModemRegisters(&rf95Config);
+}
+
+void initRF95() {
+  if ( ! rf95.init()) {
+    Serial.println("rf95 init failed, check wiring. Restarting ...");
+//***    ESP.restart();
+  }
+
+  rf95.setFrequency(frequency);
+  rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
+
+  printConfig();
+}
+
+void initWifiManager() {
+  WiFiManager wifiManager;
+  wifiManager.setTimeout(180);
+  if( ! wifiManager.autoConnect(GATEWAY_ID.c_str())) {
+    Serial.println("Timeout connecting. Restarting...");
+    delay(1000);
+    ESP.reset();
+  } 
+
+  Serial.print("WiFi connected to "); Serial.print(WiFi.SSID());
+  Serial.print(", IP address: "); Serial.println(WiFi.localIP());
+}
+
+void initOTA() {
+  ArduinoOTA.setHostname(GATEWAY_ID.c_str());
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA End");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+
+  Serial.println("OTA Ready and waiting for update...");
 }
 
 /* The frequency of the LORA transmissions drifts over time (due to temperature changes?)
@@ -215,312 +590,6 @@ void doAFC() {
   }  
 }
 
-void sendToHabitat(LogEntry le) {
-
-   // TODO: how to send to Habitat?
-   // Example Raspberry Pi Habitat code here: https://github.com/PiInTheSky/lora-gateway/blob/master/habitat.c 
-   // looks like just an HTTP PUT with a correctly formatted payload
-   /*
-
-   HTTPClient http;
-   http.begin("http://habitat.habhub.org/habitat/_design/payload_telemetry/_update/add_listener/" + doc_id);
-
-   http.addHeader("Content-Type", "application/json");
-   http.addHeader("Accept", "application/json");
-   http.addHeader("charsets", "utf-8");
-
-   String payload = String("{ \"someJson\": {");
-   payload += "\"foo\": \" bla \",";
-   payload += "} }"; 
-
-   int httpCode = http.PUT(payload);
-   Serial.print("HTTP POST Response: "); Serial.println(httpCode);
-
-   http.end();
-    
-    */ 
-   
-   // for now just post some data to Thingspeak so can see something online
-
-   String sendUrl = String("http://api.thingspeak.com/update?api_key=NG2Z4N1P6BVQSGE6&field1=") + le.msg.toInt() + "&field2=" + le.rssi;
-//   Serial.print("Sending to ");  Serial.println(sendUrl);
-   HTTPClient http;
-   http.begin(sendUrl);
-   int httpCode = http.GET();
-//   Serial.print("HTTP GET Response: "); Serial.println(httpCode); 
-   http.end();
-}
-
-void initWebServer() {
-  webServer.on("/", []() {
-    webServer.send(200, "text/html", getHtmlPage());
-  });
-  webServer.on("/setconfig", []() {
-    updateRadioConfig();
-  });
-  webServer.begin();
-  Serial.println("WebServer started on port 80");
-}
-
-String getHtmlPage() {
-  // TODO store all these literals in flash?
-  String response = 
-    "<!DOCTYPE HTML>"
-    "<HTML><HEAD>"
-      "<TITLE>" + GATEWAY_ID + "</TITLE>"
-    "</HEAD>"
-    "<BODY>"
-    "<h1>" + GATEWAY_ID + "</h1>";
-
-  time_t t = time(NULL);
-  response += "Current time is: <b>" + String(ctime(&t)) + "</b>"; 
-  response += ", up since: <b>" + String(ctime(&startupTime)) + "</b>"; 
-  response +="<br>";
-
-  response +="WiFi is "; 
-  if (WiFi.status() == WL_CONNECTED) {
-    response+="connected to: <b>"; response += WiFi.SSID();
-    response += "</b>, IP address: <b>"; response += WiFi.localIP().toString();
-    response += "</b>, WiFi connection RSSI: <b>"; response += WiFi.RSSI();
-    response += "</b>";
-  } else {
-    response+="DISCONNECTED";
-  }
-  response +="<br><br>";
-
-  response +="Messages received: <b>"; response += txReceived; 
-  response +="</b>, Receive Errors: <b>"; response += txError; 
-  response +="</b>, LORA background noise RSSI: <b>"; response += (rf95.spiRead(RH_RF95_REG_1B_RSSI_VALUE) - 137); 
-  response +="</b>"; 
-  response +="<br>";
-
-  response +=
-    "<h2>Receiver Settings</h2>"
-    "<form action=\"setconfig\">"
-      "Frequency (MHz):"
-      "<input type=\"text\" name=\"frequency\" value=\"" + String(frequency, 4) + "\">"
-      "&nbsp;&nbsp;"
-      "Spreading Factor:"
-      "<select name=\"sf\">"
-        "<option " + (spreadingFactor==6? "selected" : "") + " value=\"6\">6</option>"
-        "<option " + (spreadingFactor==7? "selected" : "") + " value=\"7\">7</option>"
-        "<option " + (spreadingFactor==8? "selected" : "") + " value=\"8\">8</option>"
-        "<option " + (spreadingFactor==9? "selected" : "") + " value=\"9\">9</option>"
-        "<option " + (spreadingFactor==10? "selected" : "") + " value=\"10\">10</option>"
-        "<option " + (spreadingFactor==11? "selected" : "") + " value=\"11\">11</option>"
-        "<option " + (spreadingFactor==12? "selected" : "") + " value=\"12\">12</option>"
-      "</select>"
-      "&nbsp;&nbsp;"
-      "Bandwidth:"
-      "<select name=\"bw\">"
-        "<option " + (bandwidth==0x00? "selected" : "") + " value=\"7k8\">7k8</option>"
-        "<option " + (bandwidth==0x10? "selected" : "") + " value=\"10k4\">10k4</option>"
-        "<option " + (bandwidth==0x20? "selected" : "") + " value=\"15k6\">15k6</option>"
-        "<option " + (bandwidth==0x30? "selected" : "") + " value=\"20k8\">20k8</option>"
-        "<option " + (bandwidth==0x40? "selected" : "") + " value=\"31k25\">31k25</option>"
-        "<option " + (bandwidth==0x50? "selected" : "") + " value=\"41k7\">41k7</option>"
-        "<option " + (bandwidth==0x60? "selected" : "") + " value=\"62k5\">62k5</option>"
-        "<option " + (bandwidth==0x70? "selected" : "") + " value=\"125k\">125k</option>"
-        "<option " + (bandwidth==0x80? "selected" : "") + " value=\"250k\">250k</option>"
-        "<option " + (bandwidth==0x90? "selected" : "") + " value=\"500k\">500k</option>"
-      "</select>"
-      "&nbsp;&nbsp;"
-      "Coding rate:"
-      "<select name=\"codingRate\">"
-        "<option " + (codingRate==0x02? "selected" : "") + " value=\"4/5\">4/5</option>"
-        "<option " + (codingRate==0x04? "selected" : "") + " value=\"4/6\">4/6</option>"
-        "<option " + (codingRate==0x06? "selected" : "") + " value=\"4/7\">4/7</option>"
-        "<option " + (codingRate==0x08? "selected" : "") + " value=\"4/8\">4/8</option>"
-      "</select>"
-      "<br>"
-
-      "<input type=\"checkbox\" name=\"afc\" value=\"On\" " + (afc ? "checked" : "") + ">AFC<br>" 
-
-      "<input type=\"submit\" value=\"Update\">"
-      
-      + (configUpdated ? "<b>Updated</b>" : "") + 
-      + (postAfcMsgs ? "&nbsp;<b>**AFC Change**</b>" : "") + 
-    "</form> ";
-  
-  response +="<h2>Message Log</h2>";
-  response +="<table style=\"max_width: 100%; min-width: 40%; border: 1px solid black; border-collapse: collapse;\" class=\"config_table\">";
-  response +="<tr>";
-  response +="<th style=\"background-color: green; color: white;\">Time</th>";
-  response +="<th style=\"background-color: green; color: white;\">RSSI</th>";
-  response +="<th style=\"background-color: green; color: white;\">Freq Err</th>";
-  response +="<th style=\"background-color: green; color: white;\">Sentance</th>";
-  response +="</tr>";
-  int j = nextLogIndex;
-  for (int i=0; i<LOG_SIZE; i++) {
-     j--;
-     if (j<0) j=LOG_SIZE-1;
-     if (msgLog[j].t != NULL) {
-       response +="<tr>"; 
-       response +="<td style=\"border: 1px solid black;\">" + String(ctime(&msgLog[j].t)) + "</td>"; 
-       response +="<td style=\"border: 1px solid black;\">" + String(msgLog[j].rssi) + "</td>"; 
-       response +="<td style=\"border: 1px solid black;\">" + String(msgLog[j].freqErr) + "</td>"; 
-       response +="<td style=\"border: 1px solid black;\">" + msgLog[j].msg + "</td>"; 
-       response+="</tr>";
-     }
-  }
-  response +="</table>";
-    
-  response +="</BODY></HTML>";
-
-  configUpdated = false;
-  
-  return response;
-}
-
-void updateRadioConfig() {
-    double fx = webServer.arg("frequency").toFloat();
-    if (fx != frequency) {
-      frequency = fx;
-      rf95.setFrequency(frequency);
-      configUpdated = true;
-    }
-
-   int sfx = webServer.arg("sf").toInt();
-
-   String bws = webServer.arg("bw");
-   byte bwx = bandwidthTobyte(bws);
-
-   String crs = webServer.arg("codingRate");
-   byte crx = codingRateToByte(crs);
-
-   if (bwx != bandwidth || sfx != spreadingFactor || crx != codingRate) {
-      bandwidth = bwx;
-      spreadingFactor = sfx;
-      codingRate = crx;
-      rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
-      configUpdated = true;
-   }
-
-   String afcs = webServer.arg("afc");
-   boolean afcx = (afcs == "On");
-   if (afcx != afc) {
-    afc = afcx;
-    configUpdated = true;
-   }
-   
-   if (configUpdated) {
-      persistConfig();
-   }
-   
-   // redirect back to main page
-   webServer.sendHeader("Location", String("/"), true);
-   webServer.send ( 302, "text/plain", "");
-}
-
-void persistConfig() {
-  EEPROM.begin(512);
-  EEPROM.write(0, 0x77); // flag to indicate EEPROM contains a config
-  int addr = 1;
-  EEPROM.put(addr, frequency); addr += sizeof(frequency);
-  EEPROM.put(addr, spreadingFactor); addr += sizeof(spreadingFactor);
-  EEPROM.put(addr, bandwidth); addr += sizeof(bandwidth);
-  EEPROM.put(addr, codingRate); addr += sizeof(codingRate);
-  EEPROM.put(addr, explicitHeaders); addr += sizeof(explicitHeaders);
-  EEPROM.put(addr, rateOptimization); addr += sizeof(rateOptimization);
-  EEPROM.put(addr, afc); addr += sizeof(afc);
-  // update loadConfig() and printConfig() if anything else added here
-  
-  EEPROM.commit();
-
-  Serial.print("Saved "); printConfig();
-}
-
-void loadConfig() {
-  EEPROM.begin(512);
-
-  if (EEPROM.read(0) != 0x77) return; // do nothing if no config previously saved yet
-
-  int addr = 1;
-  EEPROM.get(addr, frequency); addr += sizeof(frequency);
-  EEPROM.get(addr, spreadingFactor); addr += sizeof(spreadingFactor);
-  EEPROM.get(addr, bandwidth); addr += sizeof(bandwidth);
-  EEPROM.get(addr, codingRate); addr += sizeof(codingRate);
-  EEPROM.get(addr, explicitHeaders); addr += sizeof(explicitHeaders);
-  EEPROM.get(addr, rateOptimization); addr += sizeof(rateOptimization);
-  EEPROM.get(addr, afc); addr += sizeof(afc);
-}
-
-void printConfig() {
-  Serial.print("Config: Frequency="); Serial.print(frequency, 4); 
-  Serial.print(" (MHz), SpreadingFactor="); Serial.print(spreadingFactor);
-  Serial.print(", Bandwidth="); Serial.print(bandwidthToString(bandwidth));
-  Serial.print(", ECC codingRate="); Serial.print(codingRateToString(codingRate));
-  Serial.print(", Headers are "); Serial.print(explicitHeaders? "Explicit" : "Implicit");
-  Serial.print(", Rate Optimization is "); Serial.print(rateOptimization? "On" : "Off");
-  Serial.print(", AFC is "); Serial.print(afc? "On" : "Off");
-  Serial.println();
-}
-
-/* Configure the LORA radio settings
- *  Bandwidth can be: (See section 4.1.1.4. Signal Bandwidth)
- *  Spreading Factor can be 6 to 12 (See section 4.1.1.2. Spreading Factor)
- *  Coding Rate can be 2, 4, 6, or 8 (See section 4.1.1.3. Coding Rate)
- *  Rate Optimization can be 
- */
-void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean explicitHeaders, boolean rateOptimisation) {
-  RH_RF95::ModemConfig rf95Config;
-  rf95Config.reg_1d = bandwidth + codingRate + (explicitHeaders ? 1 : 0);
-  rf95Config.reg_1e = (spreadingFactor * 16) + 7;
-  rf95Config.reg_26 = (rateOptimisation ? 0x08 : 0x00); // TODO: what is rateOptimisation about?
-  
-  rf95.setModemRegisters(&rf95Config);
-}
-
-void initRF95() {
-  if ( ! rf95.init()) {
-    Serial.println("rf95 init failed, check wiring. Restarting ...");
-    ESP.restart();
-  }
-
-  rf95.setFrequency(frequency);
-  rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
-
-  printConfig();
-}
-
-void initWifiManager() {
-  WiFiManager wifiManager;
-  wifiManager.setTimeout(180);
-  if( ! wifiManager.autoConnect(GATEWAY_ID.c_str())) {
-    Serial.println("Timeout connecting. Restarting...");
-    delay(1000);
-    ESP.reset();
-  } 
-
-  Serial.print("WiFi connected to "); Serial.print(WiFi.SSID());
-  Serial.print(", IP address: "); Serial.println(WiFi.localIP());
-}
-
-void initOTA() {
-  ArduinoOTA.setHostname(GATEWAY_ID.c_str());
-
-  ArduinoOTA.onStart([]() {
-    Serial.println("OTA Start");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nOTA End");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("OTA Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-  });
-  ArduinoOTA.begin();
-
-  Serial.println("OTA Ready and waiting for update...");
-}
-
 // NTP takes a few seconds to initialize with time from internet
 void waitForNTP() {
    int timeout = 300; // 30 seconds
@@ -531,6 +600,58 @@ void waitForNTP() {
    Serial.print("Time at startup: "); Serial.println(ctime(&startupTime));
 }
 
+// returns the XOR checksum of a String
+String xorChecksum(String s) {
+  byte b = s.charAt(0);
+  for (int i=1; i<s.length(); i++) {
+    b = b ^ s.charAt(i);
+  }
+  String checksum = String(b, HEX);
+  if (checksum.length() ==1) checksum = "0" + checksum; 
+  return checksum;
+}
+
+/* Turns a ctime string "Ddd Mmm DD HH:MM:SS YYYY" into
+ * a time HH:MM:SS
+ */
+String getTimeNow(time_t t) {
+  String ts = String(ctime(&t));
+  return ts.substring(11, 19);
+}
+
+/* Turns a ctime string "Ddd Mmm DD HH:MM:SS YYYY" into
+ * an RFC3339 format string "YYYY-MM-DDTHH:MM:SS+00:00" 
+ * (a bit hacky)
+ */
+String getRFC3339Time(time_t t) {
+  String ts = String(ctime(&t));
+  String rfc3339 = ts.substring(ts.length()-5, ts.length()-1);
+  rfc3339 += '-';
+  int monthInt;
+  String monthS = ts.substring(4,7);
+  if (monthS.equals("Jan")) monthInt = 1;
+  else if (monthS.equals("Feb")) monthInt = 2;
+  else if (monthS.equals("Mar")) monthInt = 3;
+  else if (monthS.equals("Apr")) monthInt = 4;
+  else if (monthS.equals("May")) monthInt = 5;
+  else if (monthS.equals("Jun")) monthInt = 6;
+  else if (monthS.equals("Jul")) monthInt = 7;
+  else if (monthS.equals("Aug")) monthInt = 8;
+  else if (monthS.equals("Sep")) monthInt = 9;
+  else if (monthS.equals("Oct")) monthInt = 10;
+  else if (monthS.equals("Nov")) monthInt = 11;
+  else monthInt = 12;
+  rfc3339 += monthInt;
+  rfc3339 += '-';
+  rfc3339 += ts.substring(8,10);
+  rfc3339 += 'T';
+  rfc3339 += ts.substring(11,19);
+  rfc3339 += "+00:00";
+    
+  return rfc3339;  
+}
+
+// Bytes to hex string, in pairs with uppercase and leading zeros 
 String byteArrayToHexString(uint8_t buf[], uint8_t len) {
   String s;
   for (int i=0; i<len; i++) {
@@ -609,9 +730,9 @@ double bandwidthToDecimal(byte bw) {
 String bandwidthToString(byte bw) {
   switch (bw) {
     case  BANDWIDTH_7K8:    return BANDWIDTH_7K8_S;
-    case  BANDWIDTH_10K4:   return BANDWIDTH_7K8_S; 
-    case  BANDWIDTH_15K6:   return BANDWIDTH_7K8_S; 
-    case  BANDWIDTH_20K8:   return BANDWIDTH_7K8_S; 
+    case  BANDWIDTH_10K4:   return BANDWIDTH_10K4_S; 
+    case  BANDWIDTH_15K6:   return BANDWIDTH_15K6_S; 
+    case  BANDWIDTH_20K8:   return BANDWIDTH_20K8_S; 
     case  BANDWIDTH_31K25:  return BANDWIDTH_31K25_S; 
     case  BANDWIDTH_41K7:   return BANDWIDTH_41K7_S; 
     case  BANDWIDTH_62K5:   return BANDWIDTH_62K5_S; 
