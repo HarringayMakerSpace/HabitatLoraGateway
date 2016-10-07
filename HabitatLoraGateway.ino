@@ -1,4 +1,4 @@
-/*  HAB Gateway
+/*  Habitat LORA Gateway
  *  
  *  *** unfinished, work in progress ***
  *  
@@ -72,15 +72,15 @@ byte codingRate = 8;
 boolean explicitHeaders = false;
 boolean rateOptimization = true;
 boolean afc = true;
-boolean habitat = true;
-int postAfcMsgs = 0;
-String  gatewayName = "HMS-"; // will have the ESP Chip ID appended
+boolean habitat = false;
+String  gatewayName = "HMS-"; // default name will have the ESP Chip ID appended
 
 boolean configUpdated = false;
+boolean afcChange = false;
 
 void setup() {
   Serial.begin(115200); Serial.println();
-  Serial.println("HMS LORA Gateway, compiled: "  __DATE__  ", " __TIME__ );
+  Serial.println("Habitat LORA Gateway, compiled: "  __DATE__  ", " __TIME__ );
 
   gatewayName += String(ESP.getChipId(), HEX);
   loadConfig();
@@ -137,10 +137,9 @@ void receiveTransmission() {
      sendToHabitat(le);
   }
 
-  if (afc && (postAfcMsgs == 0))
+  if (afc) { 
     doAFC();
-  else 
-    if (postAfcMsgs > 0) postAfcMsgs--;
+  }
 }
 
 // $$test1,1,01:23:45,51.58680343,-0.10234091,23*28\n
@@ -148,8 +147,9 @@ void sendToHabitat(LogEntry le) {
 
    // TODO: do this async in the background so as not to block LORA receives? 
 
-  //String sentance = le.msg + "*" + xorChecksum(le.msg) + "\n";
-  String b64Sentence = base64::encode(le.msg);
+  String sentence = le.msg + "*" + xorChecksum(le.msg) + "\n";
+  String b64Sentence = base64::encode(sentence);
+//  String b64Sentence = base64::encode(le.msg);
   String sha256Sentence = sha256Hash(b64Sentence);
 
    HTTPClient http;
@@ -201,7 +201,7 @@ String getHtmlPage() {
       "<TITLE>" + gatewayName + "</TITLE>"
     "</HEAD>"
     "<BODY>"
-    "<h1>" + gatewayName + "</h1>";
+    "<h1>Habitat LORA Gateway: " + gatewayName + "</h1>";
 
   time_t t = time(NULL);
   response += "Current time is: <b>" + String(ctime(&t)) + "</b>"; 
@@ -226,7 +226,7 @@ String getHtmlPage() {
   response +="<br>";
 
   response +=
-    "<h2>Receiver Settings</h2>"
+    "<h2>Settings</h2>"
     "<form action=\"setconfig\">"
       "Gateway Name:"
       "<input type=\"text\" name=\"gatewayName\" value=\"" + gatewayName + "\">"
@@ -268,14 +268,21 @@ String getHtmlPage() {
       "</select>"
       "<br>"
 
+      "<input type=\"checkbox\" name=\"explicitHeaders\" value=\"On\" " + (explicitHeaders ? "checked" : "") + ">Explicit Headers" 
+      "&nbsp;&nbsp;&nbsp;"
+
+      "<input type=\"checkbox\" name=\"rateOptimization\" value=\"On\" " + (rateOptimization ? "checked" : "") + ">Rate Optimization" 
+      "&nbsp;&nbsp;&nbsp;"
+
       "<input type=\"checkbox\" name=\"afc\" value=\"On\" " + (afc ? "checked" : "") + ">AFC" 
+      "&nbsp;&nbsp;&nbsp;"
 
       "<input type=\"checkbox\" name=\"habitat\" value=\"On\" " + (habitat ? "checked" : "") + ">Habitat<br>" 
 
       "<input type=\"submit\" value=\"Update\">"
       
       + (configUpdated ? "<b>Updated</b>" : "") + 
-      + (postAfcMsgs ? "&nbsp;<b>**AFC Change**</b>" : "") + 
+      + (afcChange ? "&nbsp;<b>**AFC Change**</b>" : "") + 
     "</form> ";
   
   response +="<h2>Message Log</h2>";
@@ -304,6 +311,7 @@ String getHtmlPage() {
   response +="</BODY></HTML>";
 
   configUpdated = false;
+  afcChange = false;
   
   return response;
 }
@@ -312,8 +320,9 @@ void updateRadioConfig() {
     double fx = webServer.arg("frequency").toFloat();
     if (fx != frequency) {
       frequency = fx;
-      // TODO: this frequency change only seems to take effect after the next receive???
+      rf95.setModeIdle();
       rf95.setFrequency(frequency);
+      rf95.setModeRx();
       configUpdated = true;
     }
 
@@ -325,10 +334,18 @@ void updateRadioConfig() {
    String crs = webServer.arg("codingRate");
    byte crx = codingRateToByte(crs);
 
-   if (bwx != bandwidth || sfx != spreadingFactor || crx != codingRate) {
+   String explicitHeadersS = webServer.arg("explicitHeaders");
+   boolean explicitHeadersx = (explicitHeadersS == "On");
+
+   String rateOptimizationS = webServer.arg("rateOptimization");
+   boolean rateOptimizationx = (rateOptimizationS == "On");
+
+   if (bwx != bandwidth || sfx != spreadingFactor || crx != codingRate || explicitHeadersx != explicitHeaders || rateOptimizationx != rateOptimization) {
       bandwidth = bwx;
       spreadingFactor = sfx;
       codingRate = crx;
+      explicitHeaders = explicitHeadersx;
+      rateOptimization = rateOptimizationx;
       rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
       configUpdated = true;
    }
@@ -449,7 +466,9 @@ void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean e
   rf95Config.reg_1e = (spreadingFactor * 16) + 7;
   rf95Config.reg_26 = (rateOptimisation ? 0x08 : 0x00); // TODO: what is rateOptimisation about?
   
+  rf95.setModeIdle();
   rf95.setModemRegisters(&rf95Config);
+  rf95.setModeRx();
 }
 
 void initRF95() {
@@ -508,11 +527,6 @@ void initOTA() {
 */
 void doAFC() {
 
-  // TODO: this mostly seems to work but there is bug where big changes
-  // like moving from freezer to warmth then AFC compensates twice, eg - 
-  // -4567, -5432, (afc -4999), -5555, -400, (afc -5493 which is wrong  
-  // for now fix that by waiting for two msgs before doing afc again
-  
   // get the last 3 frequency errors
   int i = nextLogIndex - 1;
   if (i < 0) i = LOG_SIZE - 1;
@@ -556,12 +570,11 @@ void doAFC() {
   if (abs(fe) > 200) {
     Serial.print("*** AFC: adjusting frequency by "); Serial.print(fe); Serial.println(" Hz ***");
     frequency += (fe / 1000000.0);
+    rf95.setModeIdle();
     rf95.setFrequency(frequency);
+    rf95.setModeRx();
     persistConfig();    
-
-    // the freq change only seems to get picked up after the next message received, so 
-    // don't do another AFC change for two more received msgs
-    postAfcMsgs = 2;
+    afcChange = true;
   }  
 }
 
