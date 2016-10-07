@@ -84,6 +84,7 @@ void setup() {
 
   gatewayName += String(ESP.getChipId(), HEX);
   loadConfig();
+  printConfig();
   
   initWifiManager();
   initOTA();
@@ -118,7 +119,7 @@ void receiveTransmission() {
   LogEntry le;
   le.t = time(NULL);
   le.rssi = rf95.lastRssi();
-  le.freqErr = (frequencyError());
+  le.freqErr = frequencyError();
 
   if (buf[0] == '$' && buf[1] == '$') {
     buf[len] = 0x00; // ensure null terminated
@@ -147,8 +148,8 @@ void sendToHabitat(LogEntry le) {
 
    // TODO: do this async in the background so as not to block LORA receives? 
 
-  String sentance = le.msg + "*" + xorChecksum(le.msg) + "\n";
-  String b64Sentence = base64::encode(sentance);
+  //String sentance = le.msg + "*" + xorChecksum(le.msg) + "\n";
+  String b64Sentence = base64::encode(le.msg);
   String sha256Sentence = sha256Hash(b64Sentence);
 
    HTTPClient http;
@@ -176,7 +177,7 @@ void sendToHabitat(LogEntry le) {
    
    int httpCode = http.sendRequest("PUT", payload);
    Serial.print("Habitat PUT Response: "); Serial.println(httpCode);
-   // TODO: do something with errors? Maybe save the sentance and try again later
+   // TODO: do something with errors? Maybe save the sentence and try again later
    
    http.end();
 }
@@ -311,6 +312,7 @@ void updateRadioConfig() {
     double fx = webServer.arg("frequency").toFloat();
     if (fx != frequency) {
       frequency = fx;
+      // TODO: this frequency change only seems to take effect after the next receive???
       rf95.setFrequency(frequency);
       configUpdated = true;
     }
@@ -345,11 +347,11 @@ void updateRadioConfig() {
     configUpdated = true;
    }
 
-    String gns = webServer.arg("gatewayName");
-    if (gns != gatewayName) {
-      gatewayName = gns;
-      configUpdated = true;
-    }
+   String gns = webServer.arg("gatewayName");
+   if (gns != gatewayName) {
+     gatewayName = gns;
+     configUpdated = true;
+   }
    
    if (configUpdated) {
       persistConfig();
@@ -416,6 +418,7 @@ void printConfig() {
   Serial.println();
 }
 
+// are these eeprom read/write String functions in Arduino code somewhere?
 int eepromWriteString(int addr, String s) {
   int l = s.length();
   for (int i=0; i<l; i++) {
@@ -452,13 +455,11 @@ void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean e
 void initRF95() {
   if ( ! rf95.init()) {
     Serial.println("rf95 init failed, check wiring. Restarting ...");
-//***    ESP.restart();
+    ESP.restart();
   }
 
   rf95.setFrequency(frequency);
   rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
-
-  printConfig();
 }
 
 void initWifiManager() {
@@ -553,7 +554,7 @@ void doAFC() {
 
   // if its greater the 200Hz make an adjustment
   if (abs(fe) > 200) {
-    Serial.print("***AFC: adjusting frequency by "); Serial.print(fe); Serial.println(" Hz");
+    Serial.print("*** AFC: adjusting frequency by "); Serial.print(fe); Serial.println(" Hz ***");
     frequency += (fe / 1000000.0);
     rf95.setFrequency(frequency);
     persistConfig();    
@@ -585,9 +586,7 @@ String xorChecksum(String s) {
   return checksum;
 }
 
-/* Turns a ctime string "Ddd Mmm DD HH:MM:SS YYYY" into
- * a time HH:MM:SS
- */
+// Turns a ctime string "Ddd Mmm DD HH:MM:SS YYYY" into HH:MM:SS
 String getTimeNow(time_t t) {
   String ts = String(ctime(&t));
   return ts.substring(11, 19);
@@ -643,7 +642,7 @@ String byteArrayToHexString(uint8_t buf[], uint8_t len) {
 #define REG_FREQ_ERROR 0x28
 
 // frequency error calculation from https://github.com/daveake/LoRaArduinoSerial/blob/master/LoRaArduinoSerial.ino
-double frequencyError(void) {
+double frequencyError() {
 
   int32_t Temp = (int32_t)rf95.spiRead(REG_FREQ_ERROR) & 7;
   Temp <<= 8L;
