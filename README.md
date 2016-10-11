@@ -7,7 +7,7 @@ It uses an ESP8266/Arduino WiFi microcontroller with an RFM98 LORA radio transce
 - tzapu's WifiManager is used to simplify the WiFi configuration.
 - It runs a web server with simple web application to view/update the gateway status and radio configuration
 
-Using an ESP module with builtin USB power such as a NodeMCU or Wemos Mini enables powering the gateway from a USB socket on a PC or phone charger or chase car which makes the whole gateway is simple, self contained, and costs less than £10 so you can have a bunch of them.   
+Using an ESP module with builtin USB power such as a NodeMCU or Wemos Mini enables powering the gateway from a USB socket on a PC or phone charger or chase car which makes the whole gateway is simple, self contained, and costs less than Â£10 so you can have a bunch of them.   
 
 The Gateway web application looks like this:
 
@@ -50,3 +50,4 @@ You need the Arduino IDE, the ESP8266 support added to the IDE, and this sketch 
 - Get the Arduino IDE [here](https://www.arduino.cc/en/Main/Software).
 
 - The Arduino IDE doesn't support the ESP8266 be default so you need to add that. Start up the IDE, go to File -> Preferences, and in the "Additional Boards Manager URLs" field add the ESP8266 URL "http://arduino.esp8266.com/stable/package_esp8266com_index.json". Then go to Tools -> Board: -> Boards Manager... By Type change "All" to "Contributed". The eSP8266 should appear, select it and then click Install. Thats it. Read more about it [here](https://github.com/esp8266/Arduino/#installing-with-boards-manager).
+
