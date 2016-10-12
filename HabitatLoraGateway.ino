@@ -43,8 +43,10 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h> 
 
-#define NSS_PIN 15
-#define DIO0_PIN 5
+//#define NSS_PIN 15
+//#define DIO0_PIN 5
+#define NSS_PIN 16
+#define DIO0_PIN 15
 
 RH_RF95 rf95(NSS_PIN, DIO0_PIN);
 
@@ -121,9 +123,10 @@ void receiveTransmission() {
   le.rssi = rf95.lastRssi();
   le.freqErr = frequencyError();
 
-  if (buf[0] == '$' && buf[1] == '$') {
+  if (rf95.headerTo() == '$' && rf95.headerFrom() == '$') {
     buf[len] = 0x00; // ensure null terminated
-    le.msg = String((char*)buf);     
+    le.msg = String((char)rf95.headerTo()) + (char) rf95.headerFrom() + (char) rf95.headerId() + (char) rf95.headerFlags();
+    le.msg += String((char*)buf);     
   } else {
     le.msg = byteArrayToHexString(buf, len);
   }
@@ -465,7 +468,22 @@ void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean e
   rf95Config.reg_1d = bandwidth + codingRate + (explicitHeaders ? 1 : 0);
   rf95Config.reg_1e = (spreadingFactor * 16) + 7;
   rf95Config.reg_26 = (rateOptimisation ? 0x08 : 0x00); // TODO: what is rateOptimisation about?
+
+  Serial.println(rf95Config.reg_1d, HEX);
+  Serial.println(rf95Config.reg_1e, HEX);
+  Serial.println(rf95Config.reg_26, HEX);
+
+//  rf95Config.reg_1d = 0x38;
+//  rf95Config.reg_1e = 0xB4;
+ // rf95Config.reg_26 = 0x0C;
+  rf95Config.reg_1d = 0x62;
+  rf95Config.reg_1e = 0xC7;
+  rf95Config.reg_26 = 0x08;
   
+  Serial.println(rf95Config.reg_1d, HEX);
+  Serial.println(rf95Config.reg_1e, HEX);
+  Serial.println(rf95Config.reg_26, HEX);
+
   rf95.setModeIdle();
   rf95.setModemRegisters(&rf95Config);
   rf95.setModeRx();
@@ -478,6 +496,7 @@ void initRF95() {
   }
 
   rf95.setFrequency(frequency);
+  rf95.setPromiscuous(true);
   rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
 }
 
