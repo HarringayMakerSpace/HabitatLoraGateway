@@ -17,6 +17,10 @@ A gateway with minimal hardware:
 
 ![Alt text](/doc/BareBones1.jpg?raw=true "Minimal hardware")
 
+Soldering wires directly to the LORA module is a bit tricky and fragile, a much nicer solution is [this shield](https://github.com/hallard/WeMos-Lora) for a Wemos ESP8266 board. That makes a really compact and robust gateway that just needs a USB power supply:
+
+![Alt text](/doc/WemosRFM98.jpg?raw=true "Wemos based Gateway")
+
 ## What you need - the hardware
 
 - An ESP8266. There are lots of different type of ESP8266 modules, this code should run on any of them. To keep it simple one of the ones with built in power supply and USB serial support are easiest, such as the [NodeMCU](https://en.wikipedia.org/wiki/NodeMCU) or [Wemos D1 Mini](https://www.wemos.cc/product/d1-mini.html). You should be able to pick one up for just a few dollars.
