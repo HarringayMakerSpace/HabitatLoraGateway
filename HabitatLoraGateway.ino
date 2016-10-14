@@ -43,6 +43,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h> 
 
+// Change NSS and DIO-0 pins to match how your modules are wired together
 //#define NSS_PIN 15
 //#define DIO0_PIN 5
 #define NSS_PIN 16
@@ -60,6 +61,7 @@ struct LogEntry {
   time_t t;
   int rssi;
   int freqErr;
+  int habitatRC;
   String msg;
 };
 int nextLogIndex;
@@ -71,7 +73,7 @@ double frequency = 434.0000;
 byte bandwidth = 64;
 byte spreadingFactor = 11;
 byte codingRate = 8;
-boolean explicitHeaders = false;
+boolean implicitHeaders = true;
 boolean rateOptimization = true;
 boolean afc = true;
 boolean habitat = false;
@@ -122,37 +124,42 @@ void receiveTransmission() {
   le.t = time(NULL);
   le.rssi = rf95.lastRssi();
   le.freqErr = frequencyError();
+  le.habitatRC = 0;
+
+  // the RadioHead library uses the first four bytes as headers. HAB
+  // transmissions don't use headers so just use the header bytes as the payload
 
   if (rf95.headerTo() == '$' && rf95.headerFrom() == '$') {
     buf[len] = 0x00; // ensure null terminated
     le.msg = String((char)rf95.headerTo()) + (char) rf95.headerFrom() + (char) rf95.headerId() + (char) rf95.headerFlags();
     le.msg += String((char*)buf);     
   } else {
+    le.msg = String(rf95.headerTo(), HEX) + String(rf95.headerFrom(), HEX) +
+            " " + String(rf95.headerId(), HEX) + String(rf95.headerFlags(), HEX) + " ";
     le.msg = byteArrayToHexString(buf, len);
+  }
+
+  if (habitat && le.msg.startsWith("$$")) {
+    le.habitatRC = sendToHabitat(le);
+  }
+
+  if (afc) { 
+    doAFC();
   }
 
   msgLog[nextLogIndex++] = le;
   if (nextLogIndex >= LOG_SIZE) nextLogIndex = 0;
             
   Serial.println("LogEntry " + getRFC3339Time(le.t) + ", RSSI=" + le.rssi + ", Freq Err=" + le.freqErr + ", payload=" + le.msg);
-
-  if (habitat && le.msg.startsWith("$$")) {
-     sendToHabitat(le);
-  }
-
-  if (afc) { 
-    doAFC();
-  }
 }
 
 // $$test1,1,01:23:45,51.58680343,-0.10234091,23*28\n
-void sendToHabitat(LogEntry le) {
+int sendToHabitat(LogEntry le) {
 
    // TODO: do this async in the background so as not to block LORA receives? 
 
-  String sentence = le.msg + "*" + xorChecksum(le.msg) + "\n";
+  String sentence = le.msg.endsWith("\n") ? le.msg : (le.msg + "\n");
   String b64Sentence = base64::encode(sentence);
-//  String b64Sentence = base64::encode(le.msg);
   String sha256Sentence = sha256Hash(b64Sentence);
 
    HTTPClient http;
@@ -180,9 +187,9 @@ void sendToHabitat(LogEntry le) {
    
    int httpCode = http.sendRequest("PUT", payload);
    Serial.print("Habitat PUT Response: "); Serial.println(httpCode);
-   // TODO: do something with errors? Maybe save the sentence and try again later
    
    http.end();
+   return httpCode;
 }
 
 void initWebServer() {
@@ -271,7 +278,7 @@ String getHtmlPage() {
       "</select>"
       "<br>"
 
-      "<input type=\"checkbox\" name=\"explicitHeaders\" value=\"On\" " + (explicitHeaders ? "checked" : "") + ">Explicit Headers" 
+      "<input type=\"checkbox\" name=\"implicitHeaders\" value=\"On\" " + (implicitHeaders ? "checked" : "") + ">Implicit Headers" 
       "&nbsp;&nbsp;&nbsp;"
 
       "<input type=\"checkbox\" name=\"rateOptimization\" value=\"On\" " + (rateOptimization ? "checked" : "") + ">Rate Optimization" 
@@ -290,10 +297,12 @@ String getHtmlPage() {
   
   response +="<h2>Message Log</h2>";
   response +="<table style=\"max_width: 100%; min-width: 40%; border: 1px solid black; border-collapse: collapse;\" class=\"config_table\">";
+  response +="<colgroup><col span=\"1\" style=\"width: 36%;\"><col span=\"1\" style=\"width: 8%;\"><col span=\"1\" style=\"width: 8%;\"><col span=\"1\" style=\"width: 8%;\"><col span=\"1\" style=\"width: 40%;\"></colgroup>";
   response +="<tr>";
   response +="<th style=\"background-color: green; color: white;\">Time</th>";
   response +="<th style=\"background-color: green; color: white;\">RSSI</th>";
   response +="<th style=\"background-color: green; color: white;\">Freq Err</th>";
+  response +="<th style=\"background-color: green; color: white;\">Habitat</th>";
   response +="<th style=\"background-color: green; color: white;\">Sentence</th>";
   response +="</tr>";
   int j = nextLogIndex;
@@ -305,6 +314,7 @@ String getHtmlPage() {
        response +="<td style=\"border: 1px solid black;\">" + String(ctime(&msgLog[j].t)) + "</td>"; 
        response +="<td style=\"border: 1px solid black;\">" + String(msgLog[j].rssi) + "</td>"; 
        response +="<td style=\"border: 1px solid black;\">" + String(msgLog[j].freqErr) + "</td>"; 
+       response +="<td style=\"border: 1px solid black;\">" + (msgLog[j].habitatRC != 0 ? String(msgLog[j].habitatRC) : "") + "</td>"; 
        response +="<td style=\"border: 1px solid black;\">" + msgLog[j].msg + "</td>"; 
        response+="</tr>";
      }
@@ -337,19 +347,19 @@ void updateRadioConfig() {
    String crs = webServer.arg("codingRate");
    byte crx = codingRateToByte(crs);
 
-   String explicitHeadersS = webServer.arg("explicitHeaders");
-   boolean explicitHeadersx = (explicitHeadersS == "On");
+   String implicitHeadersS = webServer.arg("implicitHeaders");
+   boolean implicitHeadersx = (implicitHeadersS == "On");
 
    String rateOptimizationS = webServer.arg("rateOptimization");
    boolean rateOptimizationx = (rateOptimizationS == "On");
 
-   if (bwx != bandwidth || sfx != spreadingFactor || crx != codingRate || explicitHeadersx != explicitHeaders || rateOptimizationx != rateOptimization) {
+   if (bwx != bandwidth || sfx != spreadingFactor || crx != codingRate || implicitHeadersx != implicitHeaders || rateOptimizationx != rateOptimization) {
       bandwidth = bwx;
       spreadingFactor = sfx;
       codingRate = crx;
-      explicitHeaders = explicitHeadersx;
+      implicitHeaders = implicitHeadersx;
       rateOptimization = rateOptimizationx;
-      rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
+      rf95Config(bandwidth, spreadingFactor, codingRate, implicitHeaders, rateOptimization); 
       configUpdated = true;
    }
 
@@ -392,7 +402,7 @@ void persistConfig() {
   EEPROM.put(addr, spreadingFactor);    addr += sizeof(spreadingFactor);
   EEPROM.put(addr, bandwidth);          addr += sizeof(bandwidth);
   EEPROM.put(addr, codingRate);         addr += sizeof(codingRate);
-  EEPROM.put(addr, explicitHeaders);    addr += sizeof(explicitHeaders);
+  EEPROM.put(addr, implicitHeaders);    addr += sizeof(implicitHeaders);
   EEPROM.put(addr, rateOptimization);   addr += sizeof(rateOptimization);
   EEPROM.put(addr, afc);                addr += sizeof(afc); 
   addr = eepromWriteString(addr, gatewayName);
@@ -418,7 +428,7 @@ void loadConfig() {
   EEPROM.get(addr, spreadingFactor);         addr += sizeof(spreadingFactor);
   EEPROM.get(addr, bandwidth);               addr += sizeof(bandwidth);
   EEPROM.get(addr, codingRate);              addr += sizeof(codingRate);
-  EEPROM.get(addr, explicitHeaders);         addr += sizeof(explicitHeaders);
+  EEPROM.get(addr, implicitHeaders);         addr += sizeof(implicitHeaders);
   EEPROM.get(addr, rateOptimization);        addr += sizeof(rateOptimization);
   EEPROM.get(addr, afc);                     addr += sizeof(afc); 
   gatewayName = eepromReadString(addr);      addr += gatewayName.length() + 1;
@@ -431,7 +441,7 @@ void printConfig() {
   Serial.print(" (MHz), SpreadingFactor="); Serial.print(spreadingFactor);
   Serial.print(", Bandwidth="); Serial.print(bandwidthToString(bandwidth));
   Serial.print(", ECC codingRate="); Serial.print(codingRateToString(codingRate));
-  Serial.print(", Headers are "); Serial.print(explicitHeaders? "Explicit" : "Implicit");
+  Serial.print(", Headers are "); Serial.print(implicitHeaders? "Implicit" : "Explicit");
   Serial.print(", Rate Optimization is "); Serial.print(rateOptimization? "On" : "Off");
   Serial.print(", AFC is "); Serial.print(afc? "On" : "Off");
   Serial.print(", Habitat is "); Serial.print(habitat? "On" : "Off");
@@ -461,28 +471,20 @@ String eepromReadString(int addr) {
  *  Bandwidth can be: (See section 4.1.1.4. Signal Bandwidth)
  *  Spreading Factor can be 6 to 12 (See section 4.1.1.2. Spreading Factor)
  *  Coding Rate can be 2, 4, 6, or 8 (See section 4.1.1.3. Coding Rate)
- *  Rate Optimization can be 
+ *  Rate Optimization can be on or off and should be on with SF 11 and 12 
+ *  
+ *  The best description of the settings is in the SX1278 datasheet 
  */
-void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean explicitHeaders, boolean rateOptimisation) {
+void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean implicitHeaders, boolean rateOptimisation) {
   RH_RF95::ModemConfig rf95Config;
-  rf95Config.reg_1d = bandwidth + codingRate + (explicitHeaders ? 1 : 0);
-  rf95Config.reg_1e = (spreadingFactor * 16) + 7;
-  rf95Config.reg_26 = (rateOptimisation ? 0x08 : 0x00); // TODO: what is rateOptimisation about?
 
-  Serial.println(rf95Config.reg_1d, HEX);
-  Serial.println(rf95Config.reg_1e, HEX);
-  Serial.println(rf95Config.reg_26, HEX);
+  rf95Config.reg_1d = implicitHeaders | codingRate | bandwidth;
+  rf95Config.reg_1e = (spreadingFactor * 16) | 0x04; // 0x04 sets CRC on
+  rf95Config.reg_26 = 0x04 | (rateOptimisation ? 0x08 : 0x00); // 0x04 sets AGC on, rateOptimisation should be on for SF 11  and 12
 
-//  rf95Config.reg_1d = 0x38;
-//  rf95Config.reg_1e = 0xB4;
- // rf95Config.reg_26 = 0x0C;
-  rf95Config.reg_1d = 0x62;
-  rf95Config.reg_1e = 0xC7;
-  rf95Config.reg_26 = 0x08;
-  
-  Serial.println(rf95Config.reg_1d, HEX);
-  Serial.println(rf95Config.reg_1e, HEX);
-  Serial.println(rf95Config.reg_26, HEX);
+  Serial.print("rf95 config registers 0x1d:"); Serial.print(rf95Config.reg_1d, HEX);
+  Serial.print(", 0x1e:"); Serial.print(rf95Config.reg_1e, HEX);
+  Serial.print(", 0x26:"); Serial.println(rf95Config.reg_26, HEX);
 
   rf95.setModeIdle();
   rf95.setModemRegisters(&rf95Config);
@@ -495,9 +497,10 @@ void initRF95() {
     ESP.restart();
   }
 
+  rf95.setPromiscuous(true); // don't want the RadioHead header addressing
   rf95.setFrequency(frequency);
-  rf95.setPromiscuous(true);
-  rf95Config(bandwidth, spreadingFactor, codingRate, explicitHeaders, rateOptimization); 
+  rf95.spiWrite(RH_RF95_REG_0C_LNA, 0x23); // LNA Max Gain
+  rf95Config(bandwidth, spreadingFactor, codingRate, implicitHeaders, rateOptimization); 
 }
 
 void initWifiManager() {
@@ -546,6 +549,7 @@ void initOTA() {
 */
 void doAFC() {
 
+/*
   // get the last 3 frequency errors
   int i = nextLogIndex - 1;
   if (i < 0) i = LOG_SIZE - 1;
@@ -571,6 +575,7 @@ void doAFC() {
   int d2 = abs(fe1 - fe3);
   int d3 = abs(fe2 - fe3);
 
+
   int fe;
   if (d1 < d2)
     if (d1 < d3)
@@ -582,11 +587,20 @@ void doAFC() {
       fe = (fe1+fe3)/2;
     else
       fe = (fe2+fe3)/2;
+*/
+
+  // TODO: that code doesn't work so well with big changes
+  // for now just use the last error.
+
+  int i = nextLogIndex - 1;
+  if (i < 0) i = LOG_SIZE - 1;
+  int fe = msgLog[i].freqErr;  
+  if (abs(fe) < 200) return;
   
   // fe is now the average frequency error
 
-  // if its greater the 200Hz make an adjustment
-  if (abs(fe) > 200) {
+  // if its greater the 100 make an adjustment
+  if (abs(fe) > 100) {
     Serial.print("*** AFC: adjusting frequency by "); Serial.print(fe); Serial.println(" Hz ***");
     frequency += (fe / 1000000.0);
     rf95.setModeIdle();
