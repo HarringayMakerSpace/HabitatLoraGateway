@@ -143,14 +143,14 @@ void receiveTransmission() {
     le.habitatRC = sendToHabitat(le);
   }
 
-  if (afc) { 
-    doAFC();
-  }
-
   msgLog[nextLogIndex++] = le;
   if (nextLogIndex >= LOG_SIZE) nextLogIndex = 0;
             
   Serial.println("LogEntry " + getRFC3339Time(le.t) + ", RSSI=" + le.rssi + ", Freq Err=" + le.freqErr + ", payload=" + le.msg);
+
+  if (afc) { 
+    doAFC();
+  }
 }
 
 // $$test1,1,01:23:45,51.58680343,-0.10234091,23*28\n
@@ -544,62 +544,12 @@ void initOTA() {
 /* The frequency of the LORA transmissions drifts over time (due to temperature changes?)
  *  this tries to compensate by adjusting the Gateway receiver frequency based on the 
  *  frequency error of the received messages. 
- *  It tries to ignore spurious erorrs so of the last 3 messages it takes the average of 
- *  the two smallest errors, and only adjusts if thats greater than 200 (Hz).
-*/
+ */
 void doAFC() {
-
-/*
-  // get the last 3 frequency errors
-  int i = nextLogIndex - 1;
-  if (i < 0) i = LOG_SIZE - 1;
-  int fe1 = msgLog[i].freqErr;  
-  if (abs(fe1) < 200) return;
-
-  i = i - 1;
-  if (i < 0) i = LOG_SIZE - 1;
-  if (msgLog[i].t == NULL) return;
-  int fe2 = msgLog[i].freqErr;  
-  if (abs(fe2) < 200) return;
-
-  i = i - 1;
-  if (i < 0) i = LOG_SIZE - 1;
-  if (msgLog[i].t == NULL) return;
-  int fe3 = msgLog[i].freqErr;  
-  if (abs(fe3) < 200) return;
-
-  // fe1, fe2, fe3 are the last three frequency errors
-
-  // now find the average of the two smallest errors
-  int d1 = abs(fe1 - fe2);
-  int d2 = abs(fe1 - fe3);
-  int d3 = abs(fe2 - fe3);
-
-
-  int fe;
-  if (d1 < d2)
-    if (d1 < d3)
-      fe = (fe1+fe2)/2;
-    else 
-      fe = (fe2+fe3)/2;
-  else
-    if (d2 < d3)
-      fe = (fe1+fe3)/2;
-    else
-      fe = (fe2+fe3)/2;
-*/
-
-  // TODO: that code doesn't work so well with big changes
-  // for now just use the last error.
-
   int i = nextLogIndex - 1;
   if (i < 0) i = LOG_SIZE - 1;
   int fe = msgLog[i].freqErr;  
-  if (abs(fe) < 200) return;
-  
-  // fe is now the average frequency error
 
-  // if its greater the 100 make an adjustment
   if (abs(fe) > 100) {
     Serial.print("*** AFC: adjusting frequency by "); Serial.print(fe); Serial.println(" Hz ***");
     frequency += (fe / 1000000.0);
