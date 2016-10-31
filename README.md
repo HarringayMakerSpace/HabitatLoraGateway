@@ -25,7 +25,7 @@ Soldering wires directly to the LORA module is a bit tricky and fragile, a much 
 
 - An ESP8266. There are lots of different type of ESP8266 modules, this code should run on any of them. To keep it simple one of the ones with built in power supply and USB serial support are easiest, such as the [NodeMCU](https://en.wikipedia.org/wiki/NodeMCU) or [Wemos D1 Mini](https://www.wemos.cc/product/d1-mini.html). You should be able to pick one up for just a few dollars.
 
-- A LORA radio transceiver module. They're all based on the Hope chipset and this code should run with any of them (so far tested with the 433MHz [RFM98W](http://www.hoperf.co.uk/shop/RFM98W-433S2-RFM98W_433S2.html) and [DRF1278F](http://www.dorji.com/products-detail.php?ProId=14)).
+- A LORA radio transceiver module. They're all based on the Semtech SX127X chipset so this code should run with any of them (so far tested with the 433MHz [RFM98W](http://www.hoperf.co.uk/shop/RFM98W-433S2-RFM98W_433S2.html) and [DRF1278F](http://www.dorji.com/products-detail.php?ProId=14)).
 
 - An antenna, which could be as simple as just 173mm long piece of wire.
 
