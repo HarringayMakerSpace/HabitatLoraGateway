@@ -44,10 +44,10 @@
 #include <ArduinoOTA.h> 
 
 // Change NSS and DIO-0 pins to match how your modules are wired together
-//#define NSS_PIN 15
-//#define DIO0_PIN 5
-#define NSS_PIN 16
-#define DIO0_PIN 15
+#define NSS_PIN 15
+#define DIO0_PIN 5
+//#define NSS_PIN 16
+//#define DIO0_PIN 15
 
 RH_RF95 rf95(NSS_PIN, DIO0_PIN);
 
@@ -129,7 +129,7 @@ void receiveTransmission() {
   // the RadioHead library uses the first four bytes as headers. HAB
   // transmissions don't use headers so just use the header bytes as the payload
 
-  if (rf95.headerTo() == '$' && rf95.headerFrom() == '$') {
+  if (rf95.headerTo() == '$' && rf95.headerFrom() == '$' ) {
     buf[len] = 0x00; // ensure null terminated
     le.msg = String((char)rf95.headerTo()) + (char) rf95.headerFrom() + (char) rf95.headerId() + (char) rf95.headerFlags();
     le.msg += String((char*)buf);     
@@ -160,13 +160,15 @@ int sendToHabitat(LogEntry le) {
 
   String sentence = le.msg.endsWith("\n") ? le.msg : (le.msg + "\n");
   String b64Sentence = base64::encode(sentence);
+  b64Sentence.replace("\n","");
+  b64Sentence.replace("\r","");
   String sha256Sentence = sha256Hash(b64Sentence);
 
    HTTPClient http;
    http.begin("http://habitat.habhub.org/habitat/_design/payload_telemetry/_update/add_listener/" + sha256Sentence);
 
-   http.addHeader("Content-Type", "application/json");
    http.addHeader("Accept", "application/json");
+   http.addHeader("Content-Type", "application/json");
    http.addHeader("charsets", "utf-8");
 
    String timeNow = getRFC3339Time(time(NULL));
@@ -183,6 +185,10 @@ int sendToHabitat(LogEntry le) {
        "}"
     "}";
 
+
+   Serial.print("Habitat sentence: "); Serial.println(sentence);
+   Serial.print("Habitat b64Sentence: "); Serial.println(b64Sentence);
+   Serial.print("Habitat sha256Sentence: "); Serial.println(sha256Sentence);
    Serial.print("Habitat payload: "); Serial.println(payload);
    
    int httpCode = http.sendRequest("PUT", payload);
@@ -209,6 +215,7 @@ String getHtmlPage() {
     "<!DOCTYPE HTML>"
     "<HTML><HEAD>"
       "<TITLE>" + gatewayName + "</TITLE>"
+      "<meta http-equiv=\"refresh\" content=\"30\">"
     "</HEAD>"
     "<BODY>"
     "<h1>Habitat LORA Gateway: " + gatewayName + "</h1>";
@@ -227,8 +234,19 @@ String getHtmlPage() {
   } else {
     response+="DISCONNECTED";
   }
-  response +="<br><br>";
+//response +="<br><br>";
+String Reg_1d = String(rf95.spiRead(0x1d),HEX);
+String Reg_1e = String(rf95.spiRead(0x1e),HEX);
+String Reg_26 = String(rf95.spiRead(0x26),HEX);
 
+  response +="<br>Reg_1d:<b> ";
+  response += Reg_1d;
+  response += "</b> Reg_1e:<b> ";
+  response += Reg_1e;
+  response += "</b> Reg_26:<b> ";
+  response += Reg_26;
+  response +="</b><br>";
+  
   response +="Messages received: <b>"; response += txReceived; 
   response +="</b>, Receive Errors: <b>"; response += txError; 
   response +="</b>, LORA background noise RSSI: <b>"; response += (rf95.spiRead(RH_RF95_REG_1B_RSSI_VALUE) - 137); 
@@ -481,7 +499,8 @@ void rf95Config(byte bandwidth, byte spreadingFactor, byte codingRate, boolean i
   rf95Config.reg_1d = implicitHeaders | codingRate | bandwidth;
   rf95Config.reg_1e = (spreadingFactor * 16) | 0x04; // 0x04 sets CRC on
   rf95Config.reg_26 = 0x04 | (rateOptimisation ? 0x08 : 0x00); // 0x04 sets AGC on, rateOptimisation should be on for SF 11  and 12
-
+  //rf95Config.reg_26 = (rateOptimisation ? 0x04 : 0x00); // 0x04 sets AGC on, rateOptimisation should be on for SF 11  and 12
+  
   Serial.print("rf95 config registers 0x1d:"); Serial.print(rf95Config.reg_1d, HEX);
   Serial.print(", 0x1e:"); Serial.print(rf95Config.reg_1e, HEX);
   Serial.print(", 0x26:"); Serial.println(rf95Config.reg_26, HEX);
@@ -596,21 +615,21 @@ String getRFC3339Time(time_t t) {
   String ts = String(ctime(&t));
   String rfc3339 = ts.substring(ts.length()-5, ts.length()-1);
   rfc3339 += '-';
-  int monthInt;
+  String monthStr;
   String monthS = ts.substring(4,7);
-  if (monthS.equals("Jan")) monthInt = 1;
-  else if (monthS.equals("Feb")) monthInt = 2;
-  else if (monthS.equals("Mar")) monthInt = 3;
-  else if (monthS.equals("Apr")) monthInt = 4;
-  else if (monthS.equals("May")) monthInt = 5;
-  else if (monthS.equals("Jun")) monthInt = 6;
-  else if (monthS.equals("Jul")) monthInt = 7;
-  else if (monthS.equals("Aug")) monthInt = 8;
-  else if (monthS.equals("Sep")) monthInt = 9;
-  else if (monthS.equals("Oct")) monthInt = 10;
-  else if (monthS.equals("Nov")) monthInt = 11;
-  else monthInt = 12;
-  rfc3339 += monthInt;
+  if (monthS.equals("Jan")) monthStr = "01";
+  else if (monthS.equals("Feb")) monthStr = "02";
+  else if (monthS.equals("Mar")) monthStr = "03";
+  else if (monthS.equals("Apr")) monthStr = "04";
+  else if (monthS.equals("May")) monthStr = "05";
+  else if (monthS.equals("Jun")) monthStr = "06";
+  else if (monthS.equals("Jul")) monthStr = "07";
+  else if (monthS.equals("Aug")) monthStr = "08";
+  else if (monthS.equals("Sep")) monthStr = "09";
+  else if (monthS.equals("Oct")) monthStr = "10";
+  else if (monthS.equals("Nov")) monthStr = "11";
+  else monthStr = "12";
+  rfc3339 += monthStr;
   rfc3339 += '-';
   rfc3339 += ts.substring(8,10);
   rfc3339 += 'T';
