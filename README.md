@@ -21,7 +21,7 @@ Soldering wires directly to the LORA module is a bit tricky and fragile, a much 
 
 ![Alt text](/doc/WemosRFM98.jpg?raw=true "Wemos based Gateway")
 
-(I had a bunch of these PCBs made and have quite a few spares now. Getting them made van be a bit slow so if you'd like one and live in the UK let me know and I could post you one for cost)
+(I had a bunch of these shield PCBs made and have quite a few spares now. Getting them made van be a bit slow so if you'd like one and live in the UK let me know and I could post you one for cost)
 
 ## What you need - the hardware
 
