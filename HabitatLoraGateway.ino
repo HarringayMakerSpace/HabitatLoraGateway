@@ -43,11 +43,15 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h> 
 
-// Change NSS and DIO-0 pins to match how your modules are wired together
-#define NSS_PIN 15
-#define DIO0_PIN 5
-//#define NSS_PIN 16
-//#define DIO0_PIN 15
+//// Change NSS and DIO-0 pins to match how your modules are wired together
+//#define NSS_PIN 15
+//#define DIO0_PIN 5
+////#define NSS_PIN 16
+////#define DIO0_PIN 15
+// Wemos LoRa shield
+#define NSS_PIN 16
+#define DIO0_PIN 15
+#define RESET_PIN 16
 
 RH_RF95 rf95(NSS_PIN, DIO0_PIN);
 
@@ -78,6 +82,8 @@ boolean rateOptimization = true;
 boolean afc = true;
 boolean habitat = false;
 String  gatewayName = "HMS-"; // default name will have the ESP Chip ID appended
+String  gatewayLat = "";
+String  gatewayLong = "";
 
 boolean configUpdated = false;
 boolean afcChange = false;
@@ -198,6 +204,69 @@ int sendToHabitat(LogEntry le) {
    return httpCode;
 }
 
+int sendGatewayLocationToHabitat() {
+
+   HTTPClient http;
+   http.begin("http://habitat.habhub.org/habitat/");
+
+   http.addHeader("Accept", "application/json");
+   http.addHeader("Content-Type", "application/json");
+   http.addHeader("charsets", "utf-8");
+
+   String timeNow = getRFC3339Time(time(NULL));
+   
+   String payload = "{" 
+     "\"type\": \"listener_telemetry\","
+     "\"time_created\": \"" + timeNow + "\","
+     "\"time_uploaded\": \"" + timeNow + "\","
+     "\"data\": {"
+       "\"callsign\": \"" + gatewayName + "\","
+       "\"latitude\": " + gatewayLat + ","
+       "\"longitude\": " + gatewayLong +
+     "}"
+   "}";
+
+   Serial.print("Habitat listener_telemetry payload: "); Serial.println(payload);
+   
+   int httpCode = http.sendRequest("POST", payload);
+   Serial.print("Habitat PUT Response: "); Serial.println(httpCode);
+   
+   http.end();
+   return httpCode;
+}
+
+int sendGatewayInfoHabitat() {
+
+   HTTPClient http;
+   http.begin("http://habitat.habhub.org/habitat/");
+
+   http.addHeader("Accept", "application/json");
+   http.addHeader("Content-Type", "application/json");
+   http.addHeader("charsets", "utf-8");
+
+   String timeNow = getRFC3339Time(time(NULL));
+   
+   String payload = "{" 
+     "\"type\": \"listener_information\","
+     "\"time_created\": \"" + timeNow + "\","
+     "\"time_uploaded\": \"" + timeNow + "\","
+     "\"data\": {"
+       "\"callsign\": \"" + gatewayName + "\","
+       "\"location\": \"London, UK\"" + ","
+       "\"radio\": \"https://bit.ly/2vdOj1u\"" + ","
+       "\"antenna\": \"DIY\""
+     "}"
+   "}";
+
+   Serial.print("Habitat listener_telemetry payload: "); Serial.println(payload);
+   
+   int httpCode = http.sendRequest("POST", payload);
+   Serial.print("Habitat PUT Response: "); Serial.println(httpCode);
+   
+   http.end();
+   return httpCode;
+}
+
 void initWebServer() {
   webServer.on("/", []() {
     webServer.send(200, "text/html", getHtmlPage());
@@ -258,7 +327,11 @@ String Reg_26 = String(rf95.spiRead(0x26),HEX);
     "<form action=\"setconfig\">"
       "Gateway Name:"
       "<input type=\"text\" name=\"gatewayName\" value=\"" + gatewayName + "\">"
-      "<br>"
+      "Gateway Location (lat/long):"
+      "<input type=\"text\" name=\"gatewayLat\" value=\"" + gatewayLat + "\">"
+      ","
+      "<input type=\"text\" name=\"gatewayLong\" value=\"" + gatewayLong + "\">"
+      "<br><p>"
       "Frequency (MHz):"
       "<input type=\"text\" name=\"frequency\" value=\"" + String(frequency, 4) + "\">"
       "&nbsp;&nbsp;"
@@ -399,6 +472,15 @@ void updateRadioConfig() {
    if (gns != gatewayName) {
      gatewayName = gns;
      configUpdated = true;
+   }
+
+   String gLats = webServer.arg("gatewayLat");
+   String gLongs = webServer.arg("gatewayLong");
+   if (gLats != gatewayLat) {
+     gatewayLat = gLats;
+     gatewayLong = gLongs;
+     sendGatewayInfoHabitat(); 
+     sendGatewayLocationToHabitat();
    }
    
    if (configUpdated) {
@@ -582,8 +664,8 @@ void doAFC() {
 
 // NTP takes a few seconds to initialize with time from internet
 void waitForNTP() {
-   int timeout = 300; // 30 seconds
-   while (time(NULL) == 0 && (timeout-- > 0)) {
+   int timeout = 10000; // 3 seconds
+   while (time(NULL) < 1000000 && (timeout-- > 0)) {
      delay(100); 
    }
    startupTime = time(NULL);
